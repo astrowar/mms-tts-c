@@ -2,6 +2,7 @@
 #define VITS_H
 
 #include <stdint.h>
+#include <stddef.h>
 #include <math.h>
 #include <stdbool.h>
 
@@ -169,6 +170,10 @@ typedef struct {
  * ============================================================ */
 typedef struct {
     int sampling_rate;
+
+    /* mmap'd weight file (for zero-copy pointer fields) */
+    const unsigned char *vtsm_map;
+    size_t vtsm_map_size;
 
     /* Text encoder */
     float embed_w[VOCAB_SIZE * HIDDEN];

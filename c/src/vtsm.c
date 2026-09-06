@@ -5,6 +5,9 @@
 #include <stdlib.h>
 #include <string.h>
 #include <sys/stat.h>
+#include <sys/mman.h>
+#include <fcntl.h>
+#include <unistd.h>
 
 /* ============================================================
  * VTSM binary loader
@@ -24,58 +27,49 @@
  *   [32..]   sequential float32 data
  * ============================================================ */
 
-/* Allocate a float array (aborts on OOM) */
-static float *fmalloc(size_t n)
-{
-    float *p = (float *)malloc(n * sizeof(float));
-    if (!p) {
-        fprintf(stderr, "[FATAL] malloc failed for %zu floats\n", n);
-        exit(1);
-    }
-    return p;
-}
-
-/* Copy a tensor from the file buffer into dst */
+/* Copy a tensor from the mapped file into inline struct storage */
 static inline void cp(const unsigned char *base, uint64_t offset,
                       float *dst, size_t n)
 {
     memcpy(dst, base + offset, n * sizeof(float));
 }
 
+/* Get a direct pointer into the mmap'd region (zero-copy for pointer fields) */
+static inline float *ptr_at(const unsigned char *base, uint64_t offset)
+{
+    return (float *)(base + offset);
+}
+
 int load_vtsm(const char *path, VitsModel *model, Vocab *vocab)
 {
     (void)vocab;
 
-    /* Check file exists and get size */
+    /* Open and mmap the file (file-backed, reclaimable by OS) */
+    int fd = open(path, O_RDONLY);
+    if (fd < 0) {
+        fprintf(stderr, "[ERROR] cannot open '%s'\n", path);
+        return -1;
+    }
+
     struct stat st;
-    if (stat(path, &st) != 0) {
+    if (fstat(fd, &st) != 0) {
         fprintf(stderr, "[ERROR] cannot stat '%s'\n", path);
+        close(fd);
         return -1;
     }
 
     size_t fsize = (size_t)st.st_size;
     if (fsize < WTS_FILE_HEADER_SIZE) {
         fprintf(stderr, "[ERROR] file too small (%zu bytes)\n", fsize);
+        close(fd);
         return -1;
     }
 
-    /* Read entire file */
-    FILE *f = fopen(path, "rb");
-    if (!f) {
-        fprintf(stderr, "[ERROR] cannot open '%s'\n", path);
-        return -1;
-    }
-    unsigned char *buf = (unsigned char *)malloc(fsize);
-    if (!buf) {
-        fprintf(stderr, "[FATAL] cannot allocate %zu bytes\n", fsize);
-        fclose(f);
-        return -1;
-    }
-    size_t nread = fread(buf, 1, fsize, f);
-    fclose(f);
-    if (nread != fsize) {
-        fprintf(stderr, "[ERROR] short read on '%s'\n", path);
-        free(buf);
+    const unsigned char *buf = (const unsigned char *)mmap(
+        NULL, fsize, PROT_READ, MAP_PRIVATE, fd, 0);
+    close(fd);
+    if (buf == MAP_FAILED) {
+        fprintf(stderr, "[ERROR] mmap failed for '%s'\n", path);
         return -1;
     }
 
@@ -91,41 +85,43 @@ int load_vtsm(const char *path, VitsModel *model, Vocab *vocab)
     if (magic != WTS_MAGIC) {
         fprintf(stderr, "[ERROR] bad magic: 0x%08x (expected 0x%08x)\n",
                 magic, WTS_MAGIC);
-        free(buf);
+        munmap((void *)buf, fsize);
         return -1;
     }
     if (version != WTS_VERSION) {
         fprintf(stderr, "[ERROR] unsupported version: %u\n", version);
-        free(buf);
+        munmap((void *)buf, fsize);
         return -1;
     }
     if (vocab_size != WTS_VOCAB_SIZE) {
         fprintf(stderr, "[ERROR] vocab size mismatch: %u (expected %d)\n",
                 vocab_size, WTS_VOCAB_SIZE);
-        free(buf);
+        munmap((void *)buf, fsize);
         return -1;
     }
     if (hidden_size != WTS_HIDDEN_SIZE) {
         fprintf(stderr, "[ERROR] hidden size mismatch: %u (expected %d)\n",
                 hidden_size, WTS_HIDDEN_SIZE);
-        free(buf);
+        munmap((void *)buf, fsize);
         return -1;
     }
     if (total_bytes != WTS_TOTAL_DATA_BYTES) {
         fprintf(stderr, "[ERROR] data size mismatch: %lu (expected %lu)\n",
                 (unsigned long)total_bytes,
                 (unsigned long)WTS_TOTAL_DATA_BYTES);
-        free(buf);
+        munmap((void *)buf, fsize);
         return -1;
     }
     if (fsize != WTS_FILE_HEADER_SIZE + (size_t)WTS_TOTAL_DATA_BYTES) {
         fprintf(stderr, "[ERROR] file size %zu != expected %lu\n", fsize,
                 (unsigned long)(WTS_FILE_HEADER_SIZE + WTS_TOTAL_DATA_BYTES));
-        free(buf);
+        munmap((void *)buf, fsize);
         return -1;
     }
 
     model->sampling_rate = SAMPLE_RATE;
+    model->vtsm_map = buf;
+    model->vtsm_map_size = fsize;
 
     /* ============================================================
      * Text Encoder
@@ -159,17 +155,13 @@ int load_vtsm(const char *path, VitsModel *model, Vocab *vocab)
         cp(buf, wts_tensors[base + 12].offset, el->ffn2_w, WTS_ENC_FFN2_W_SIZE);
         cp(buf, wts_tensors[base + 13].offset, el->ffn2_b, WTS_ENC_FFN2_B_SIZE);
 
-        /* Layer norms (pointer fields — must malloc) */
+        /* Layer norms — direct pointers into mmap */
         el->ln1.dim = HIDDEN;
         el->ln2.dim = HIDDEN;
-        el->ln1.weight = fmalloc(HIDDEN);
-        el->ln1.bias = fmalloc(HIDDEN);
-        el->ln2.weight = fmalloc(HIDDEN);
-        el->ln2.bias = fmalloc(HIDDEN);
-        cp(buf, wts_tensors[base + 14].offset, el->ln1.weight, HIDDEN);
-        cp(buf, wts_tensors[base + 15].offset, el->ln1.bias, HIDDEN);
-        cp(buf, wts_tensors[base + 16].offset, el->ln2.weight, HIDDEN);
-        cp(buf, wts_tensors[base + 17].offset, el->ln2.bias, HIDDEN);
+        el->ln1.weight = ptr_at(buf, wts_tensors[base + 14].offset);
+        el->ln1.bias = ptr_at(buf, wts_tensors[base + 15].offset);
+        el->ln2.weight = ptr_at(buf, wts_tensors[base + 16].offset);
+        el->ln2.bias = ptr_at(buf, wts_tensors[base + 17].offset);
     }
 
     /* Encoder projection */
@@ -189,32 +181,23 @@ int load_vtsm(const char *path, VitsModel *model, Vocab *vocab)
         cp(buf, wts_tensors[base + 0].offset, model->dp.conv_pre_w, WTS_DP_CONV_PRE_W_SIZE);
         cp(buf, wts_tensors[base + 1].offset, model->dp.conv_pre_b, WTS_DP_CONV_PRE_B_SIZE);
 
-        /* DDS (3 layers × 8 tensors = 24) */
+        /* DDS (3 layers × 8 tensors = 24) — direct mmap pointers */
         DDS *dds = &model->dp.conv_dds;
         dds->num_layers = DP_DDS_LAYERS;
         dds->dim = HIDDEN;
         dds->kernel = DP_KERNEL;
         for (int i = 0; i < DP_DDS_LAYERS; i++) {
             int o = base + 2 + i * 8;
-            dds->dw_w[i] = fmalloc(HIDDEN * DP_KERNEL);
-            dds->dw_b[i] = fmalloc(HIDDEN);
-            dds->pw_w[i] = fmalloc(HIDDEN * HIDDEN);
-            dds->pw_b[i] = fmalloc(HIDDEN);
+            dds->dw_w[i] = ptr_at(buf, wts_tensors[o + 0].offset);
+            dds->dw_b[i] = ptr_at(buf, wts_tensors[o + 1].offset);
+            dds->pw_w[i] = ptr_at(buf, wts_tensors[o + 2].offset);
+            dds->pw_b[i] = ptr_at(buf, wts_tensors[o + 3].offset);
             dds->norm1[i].dim = HIDDEN;
-            dds->norm1[i].weight = fmalloc(HIDDEN);
-            dds->norm1[i].bias = fmalloc(HIDDEN);
+            dds->norm1[i].weight = ptr_at(buf, wts_tensors[o + 4].offset);
+            dds->norm1[i].bias = ptr_at(buf, wts_tensors[o + 5].offset);
             dds->norm2[i].dim = HIDDEN;
-            dds->norm2[i].weight = fmalloc(HIDDEN);
-            dds->norm2[i].bias = fmalloc(HIDDEN);
-
-            cp(buf, wts_tensors[o + 0].offset, dds->dw_w[i], HIDDEN * DP_KERNEL);
-            cp(buf, wts_tensors[o + 1].offset, dds->dw_b[i], HIDDEN);
-            cp(buf, wts_tensors[o + 2].offset, dds->pw_w[i], HIDDEN * HIDDEN);
-            cp(buf, wts_tensors[o + 3].offset, dds->pw_b[i], HIDDEN);
-            cp(buf, wts_tensors[o + 4].offset, dds->norm1[i].weight, HIDDEN);
-            cp(buf, wts_tensors[o + 5].offset, dds->norm1[i].bias, HIDDEN);
-            cp(buf, wts_tensors[o + 6].offset, dds->norm2[i].weight, HIDDEN);
-            cp(buf, wts_tensors[o + 7].offset, dds->norm2[i].bias, HIDDEN);
+            dds->norm2[i].weight = ptr_at(buf, wts_tensors[o + 6].offset);
+            dds->norm2[i].bias = ptr_at(buf, wts_tensors[o + 7].offset);
         }
 
         /* conv_proj */
@@ -237,32 +220,23 @@ int load_vtsm(const char *path, VitsModel *model, Vocab *vocab)
         cp(buf, wts_tensors[base + 0].offset, cf->conv_pre_w, HIDDEN);
         cp(buf, wts_tensors[base + 1].offset, cf->conv_pre_b, HIDDEN);
 
-        /* DDS */
+        /* DDS — direct mmap pointers */
         DDS *dds = &cf->dds;
         dds->num_layers = DP_DDS_LAYERS;
         dds->dim = HIDDEN;
         dds->kernel = DP_KERNEL;
         for (int i = 0; i < DP_DDS_LAYERS; i++) {
             int o = base + 2 + i * 8;
-            dds->dw_w[i] = fmalloc(HIDDEN * DP_KERNEL);
-            dds->dw_b[i] = fmalloc(HIDDEN);
-            dds->pw_w[i] = fmalloc(HIDDEN * HIDDEN);
-            dds->pw_b[i] = fmalloc(HIDDEN);
+            dds->dw_w[i] = ptr_at(buf, wts_tensors[o + 0].offset);
+            dds->dw_b[i] = ptr_at(buf, wts_tensors[o + 1].offset);
+            dds->pw_w[i] = ptr_at(buf, wts_tensors[o + 2].offset);
+            dds->pw_b[i] = ptr_at(buf, wts_tensors[o + 3].offset);
             dds->norm1[i].dim = HIDDEN;
-            dds->norm1[i].weight = fmalloc(HIDDEN);
-            dds->norm1[i].bias = fmalloc(HIDDEN);
+            dds->norm1[i].weight = ptr_at(buf, wts_tensors[o + 4].offset);
+            dds->norm1[i].bias = ptr_at(buf, wts_tensors[o + 5].offset);
             dds->norm2[i].dim = HIDDEN;
-            dds->norm2[i].weight = fmalloc(HIDDEN);
-            dds->norm2[i].bias = fmalloc(HIDDEN);
-
-            cp(buf, wts_tensors[o + 0].offset, dds->dw_w[i], HIDDEN * DP_KERNEL);
-            cp(buf, wts_tensors[o + 1].offset, dds->dw_b[i], HIDDEN);
-            cp(buf, wts_tensors[o + 2].offset, dds->pw_w[i], HIDDEN * HIDDEN);
-            cp(buf, wts_tensors[o + 3].offset, dds->pw_b[i], HIDDEN);
-            cp(buf, wts_tensors[o + 4].offset, dds->norm1[i].weight, HIDDEN);
-            cp(buf, wts_tensors[o + 5].offset, dds->norm1[i].bias, HIDDEN);
-            cp(buf, wts_tensors[o + 6].offset, dds->norm2[i].weight, HIDDEN);
-            cp(buf, wts_tensors[o + 7].offset, dds->norm2[i].bias, HIDDEN);
+            dds->norm2[i].weight = ptr_at(buf, wts_tensors[o + 6].offset);
+            dds->norm2[i].bias = ptr_at(buf, wts_tensors[o + 7].offset);
         }
 
         /* conv_proj: Conv1d(192, 29, 1) */
@@ -319,11 +293,8 @@ int load_vtsm(const char *path, VitsModel *model, Vocab *vocab)
         model->decoder.conv_pre.k = 7;
         model->decoder.conv_pre.pad = 3;
         model->decoder.conv_pre.dilation = 1;
-        model->decoder.conv_pre.weight = fmalloc((size_t)HIFI_INIT_CH * HIDDEN * 7);
-        model->decoder.conv_pre.bias = fmalloc(HIFI_INIT_CH);
-        cp(buf, wts_tensors[base + 0].offset, model->decoder.conv_pre.weight,
-           (size_t)HIFI_INIT_CH * HIDDEN * 7);
-        cp(buf, wts_tensors[base + 1].offset, model->decoder.conv_pre.bias, HIFI_INIT_CH);
+        model->decoder.conv_pre.weight = ptr_at(buf, wts_tensors[base + 0].offset);
+        model->decoder.conv_pre.bias = ptr_at(buf, wts_tensors[base + 1].offset);
 
         /* Upsamplers: ConvTranspose1d (already transposed in binary) */
         static const int up_in[]  = {512, 256, 128, 64};
@@ -339,11 +310,8 @@ int load_vtsm(const char *path, VitsModel *model, Vocab *vocab)
             model->decoder.up[i].k = up_k[i];
             model->decoder.up[i].stride = up_s[i];
             model->decoder.up[i].pad = up_p[i];
-            size_t wsize = (size_t)up_out[i] * up_in[i] * up_k[i];
-            model->decoder.up[i].weight = fmalloc(wsize);
-            model->decoder.up[i].bias = fmalloc(up_out[i]);
-            cp(buf, wts_tensors[o + 0].offset, model->decoder.up[i].weight, wsize);
-            cp(buf, wts_tensors[o + 1].offset, model->decoder.up[i].bias, up_out[i]);
+            model->decoder.up[i].weight = ptr_at(buf, wts_tensors[o + 0].offset);
+            model->decoder.up[i].bias = ptr_at(buf, wts_tensors[o + 1].offset);
         }
 
         /* ResBlocks: 4 stages × 3 kernels */
@@ -378,22 +346,16 @@ int load_vtsm(const char *path, VitsModel *model, Vocab *vocab)
                     rb->c1[d].k = k;
                     rb->c1[d].pad = dil * (k - 1) / 2;
                     rb->c1[d].dilation = dil;
-                    rb->c1[d].weight = fmalloc((size_t)ch * ch * k);
-                    rb->c1[d].bias = fmalloc(ch);
-                    cp(buf, wts_tensors[o + d * 4 + 0].offset, rb->c1[d].weight,
-                       (size_t)ch * ch * k);
-                    cp(buf, wts_tensors[o + d * 4 + 1].offset, rb->c1[d].bias, ch);
+                    rb->c1[d].weight = ptr_at(buf, wts_tensors[o + d * 4 + 0].offset);
+                    rb->c1[d].bias = ptr_at(buf, wts_tensors[o + d * 4 + 1].offset);
 
                     rb->c2[d].in_ch = ch;
                     rb->c2[d].out_ch = ch;
                     rb->c2[d].k = k;
                     rb->c2[d].pad = (k - 1) / 2;
                     rb->c2[d].dilation = 1;
-                    rb->c2[d].weight = fmalloc((size_t)ch * ch * k);
-                    rb->c2[d].bias = fmalloc(ch);
-                    cp(buf, wts_tensors[o + d * 4 + 2].offset, rb->c2[d].weight,
-                       (size_t)ch * ch * k);
-                    cp(buf, wts_tensors[o + d * 4 + 3].offset, rb->c2[d].bias, ch);
+                    rb->c2[d].weight = ptr_at(buf, wts_tensors[o + d * 4 + 2].offset);
+                    rb->c2[d].bias = ptr_at(buf, wts_tensors[o + d * 4 + 3].offset);
                 }
             }
         }
@@ -403,71 +365,20 @@ int load_vtsm(const char *path, VitsModel *model, Vocab *vocab)
         cp(buf, wts_tensors[cp_idx].offset, model->decoder.conv_post_w, WTS_DEC_POST_W_SIZE);
     }
 
-    free(buf);
     return 0;
 }
 
 /* ============================================================
- * Free all heap-allocated weight pointers within the model.
- * Call before free(model) to release individual tensor buffers.
+ * Release the mmap'd weight file. All pointer fields point into
+ * this mapping, so a single munmap frees all weight data.
+ * Call before free(model) to release the file-backed pages.
  * ============================================================ */
 void free_model(VitsModel *model)
 {
     if (!model) return;
-
-    /* Encoder: LayerNorms per layer */
-    for (int l = 0; l < NUM_LAYERS; l++) {
-        free(model->layers[l].ln1.weight);
-        free(model->layers[l].ln1.bias);
-        free(model->layers[l].ln2.weight);
-        free(model->layers[l].ln2.bias);
-    }
-
-    /* Duration Predictor: DDS */
-    DDS *dds = &model->dp.conv_dds;
-    for (int i = 0; i < DP_DDS_LAYERS; i++) {
-        free(dds->dw_w[i]);
-        free(dds->dw_b[i]);
-        free(dds->pw_w[i]);
-        free(dds->pw_b[i]);
-        free(dds->norm1[i].weight);
-        free(dds->norm1[i].bias);
-        free(dds->norm2[i].weight);
-        free(dds->norm2[i].bias);
-    }
-
-    /* Duration Predictor: ConvFlows (4) each with internal DDS */
-    for (int fi = 0; fi < DP_NUM_FLOWS; fi++) {
-        DDS *cf_dds = &model->dp.flows[fi].dds;
-        for (int i = 0; i < DP_DDS_LAYERS; i++) {
-            free(cf_dds->dw_w[i]);
-            free(cf_dds->dw_b[i]);
-            free(cf_dds->pw_w[i]);
-            free(cf_dds->pw_b[i]);
-            free(cf_dds->norm1[i].weight);
-            free(cf_dds->norm1[i].bias);
-            free(cf_dds->norm2[i].weight);
-            free(cf_dds->norm2[i].bias);
-        }
-    }
-
-    /* HiFi-GAN: conv_pre */
-    free(model->decoder.conv_pre.weight);
-    free(model->decoder.conv_pre.bias);
-
-    /* HiFi-GAN: upsample layers */
-    for (int i = 0; i < NUM_UP; i++) {
-        free(model->decoder.up[i].weight);
-        free(model->decoder.up[i].bias);
-    }
-
-    /* HiFi-GAN: ResBlocks (4 stages × 3 kernels × 3 dilations × 2 convs × {w,b}) */
-    for (int i = 0; i < 12; i++) {
-        for (int d = 0; d < RF_DILS; d++) {
-            free(model->decoder.rb[i].c1[d].weight);
-            free(model->decoder.rb[i].c1[d].bias);
-            free(model->decoder.rb[i].c2[d].weight);
-            free(model->decoder.rb[i].c2[d].bias);
-        }
+    if (model->vtsm_map) {
+        munmap((void *)model->vtsm_map, model->vtsm_map_size);
+        model->vtsm_map = NULL;
+        model->vtsm_map_size = 0;
     }
 }
