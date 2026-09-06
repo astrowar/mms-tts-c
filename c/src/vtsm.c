@@ -27,14 +27,7 @@
  *   [32..]   sequential float32 data
  * ============================================================ */
 
-/* Copy a tensor from the mapped file into inline struct storage */
-static inline void cp(const unsigned char *base, uint64_t offset,
-                      float *dst, size_t n)
-{
-    memcpy(dst, base + offset, n * sizeof(float));
-}
-
-/* Get a direct pointer into the mmap'd region (zero-copy for pointer fields) */
+/* Get a direct pointer into the mmap'd region (zero-copy) */
 static inline float *ptr_at(const unsigned char *base, uint64_t offset)
 {
     return (float *)(base + offset);
@@ -128,7 +121,7 @@ int load_vtsm(const char *path, VitsModel *model, Vocab *vocab)
      * ============================================================ */
 
     /* Embedding */
-    cp(buf, wts_tensors[0].offset, model->embed_w, WTS_EMBED_W_SIZE);
+    model->embed_w = ptr_at(buf, wts_tensors[0].offset);
 
     /* Encoder layers */
     for (int l = 0; l < NUM_LAYERS; l++) {
@@ -136,26 +129,26 @@ int load_vtsm(const char *path, VitsModel *model, Vocab *vocab)
         int base = 1 + l * 18;  /* tensor index in wts_tensors */
 
         /* Attention projections */
-        cp(buf, wts_tensors[base + 0].offset, el->attn.q_w, WTS_ENC_ATTN_W_SIZE);
-        cp(buf, wts_tensors[base + 1].offset, el->attn.q_b, WTS_ENC_ATTN_B_SIZE);
-        cp(buf, wts_tensors[base + 2].offset, el->attn.k_w, WTS_ENC_ATTN_W_SIZE);
-        cp(buf, wts_tensors[base + 3].offset, el->attn.k_b, WTS_ENC_ATTN_B_SIZE);
-        cp(buf, wts_tensors[base + 4].offset, el->attn.v_w, WTS_ENC_ATTN_W_SIZE);
-        cp(buf, wts_tensors[base + 5].offset, el->attn.v_b, WTS_ENC_ATTN_B_SIZE);
-        cp(buf, wts_tensors[base + 6].offset, el->attn.o_w, WTS_ENC_ATTN_W_SIZE);
-        cp(buf, wts_tensors[base + 7].offset, el->attn.o_b, WTS_ENC_ATTN_B_SIZE);
+        el->attn.q_w = ptr_at(buf, wts_tensors[base + 0].offset);
+        el->attn.q_b = ptr_at(buf, wts_tensors[base + 1].offset);
+        el->attn.k_w = ptr_at(buf, wts_tensors[base + 2].offset);
+        el->attn.k_b = ptr_at(buf, wts_tensors[base + 3].offset);
+        el->attn.v_w = ptr_at(buf, wts_tensors[base + 4].offset);
+        el->attn.v_b = ptr_at(buf, wts_tensors[base + 5].offset);
+        el->attn.o_w = ptr_at(buf, wts_tensors[base + 6].offset);
+        el->attn.o_b = ptr_at(buf, wts_tensors[base + 7].offset);
 
         /* Relative positions */
-        cp(buf, wts_tensors[base + 8].offset, el->attn.rel_k, WTS_ENC_REL_SIZE);
-        cp(buf, wts_tensors[base + 9].offset, el->attn.rel_v, WTS_ENC_REL_SIZE);
+        el->attn.rel_k = ptr_at(buf, wts_tensors[base + 8].offset);
+        el->attn.rel_v = ptr_at(buf, wts_tensors[base + 9].offset);
 
         /* FFN */
-        cp(buf, wts_tensors[base + 10].offset, el->ffn1_w, WTS_ENC_FFN1_W_SIZE);
-        cp(buf, wts_tensors[base + 11].offset, el->ffn1_b, WTS_ENC_FFN1_B_SIZE);
-        cp(buf, wts_tensors[base + 12].offset, el->ffn2_w, WTS_ENC_FFN2_W_SIZE);
-        cp(buf, wts_tensors[base + 13].offset, el->ffn2_b, WTS_ENC_FFN2_B_SIZE);
+        el->ffn1_w = ptr_at(buf, wts_tensors[base + 10].offset);
+        el->ffn1_b = ptr_at(buf, wts_tensors[base + 11].offset);
+        el->ffn2_w = ptr_at(buf, wts_tensors[base + 12].offset);
+        el->ffn2_b = ptr_at(buf, wts_tensors[base + 13].offset);
 
-        /* Layer norms — direct pointers into mmap */
+        /* Layer norms */
         el->ln1.dim = HIDDEN;
         el->ln2.dim = HIDDEN;
         el->ln1.weight = ptr_at(buf, wts_tensors[base + 14].offset);
@@ -167,8 +160,8 @@ int load_vtsm(const char *path, VitsModel *model, Vocab *vocab)
     /* Encoder projection */
     {
         int base = 1 + NUM_LAYERS * 18;  /* tensor index 109 */
-        cp(buf, wts_tensors[base + 0].offset, model->proj_w, WTS_ENC_PROJ_W_SIZE);
-        cp(buf, wts_tensors[base + 1].offset, model->proj_b, WTS_ENC_PROJ_B_SIZE);
+        model->proj_w = ptr_at(buf, wts_tensors[base + 0].offset);
+        model->proj_b = ptr_at(buf, wts_tensors[base + 1].offset);
     }
 
     /* ============================================================
@@ -178,10 +171,10 @@ int load_vtsm(const char *path, VitsModel *model, Vocab *vocab)
         int base = 111;  /* dp.main section starts at tensor 111 */
 
         /* conv_pre */
-        cp(buf, wts_tensors[base + 0].offset, model->dp.conv_pre_w, WTS_DP_CONV_PRE_W_SIZE);
-        cp(buf, wts_tensors[base + 1].offset, model->dp.conv_pre_b, WTS_DP_CONV_PRE_B_SIZE);
+        model->dp.conv_pre_w = ptr_at(buf, wts_tensors[base + 0].offset);
+        model->dp.conv_pre_b = ptr_at(buf, wts_tensors[base + 1].offset);
 
-        /* DDS (3 layers × 8 tensors = 24) — direct mmap pointers */
+        /* DDS (3 layers × 8 tensors = 24) */
         DDS *dds = &model->dp.conv_dds;
         dds->num_layers = DP_DDS_LAYERS;
         dds->dim = HIDDEN;
@@ -202,13 +195,13 @@ int load_vtsm(const char *path, VitsModel *model, Vocab *vocab)
 
         /* conv_proj */
         int proj_idx = base + 2 + DP_DDS_LAYERS * 8;  /* +24 */
-        cp(buf, wts_tensors[proj_idx + 0].offset, model->dp.conv_proj_w, WTS_DP_CONV_PROJ_W_SIZE);
-        cp(buf, wts_tensors[proj_idx + 1].offset, model->dp.conv_proj_b, WTS_DP_CONV_PROJ_B_SIZE);
+        model->dp.conv_proj_w = ptr_at(buf, wts_tensors[proj_idx + 0].offset);
+        model->dp.conv_proj_b = ptr_at(buf, wts_tensors[proj_idx + 1].offset);
 
         /* Flow 0: ElementwiseAffine */
         int ea_idx = proj_idx + 2;  /* +26 */
-        cp(buf, wts_tensors[ea_idx + 0].offset, model->dp.flow_0.translate, DP_CHANNELS);
-        cp(buf, wts_tensors[ea_idx + 1].offset, model->dp.flow_0.log_scale, DP_CHANNELS);
+        model->dp.flow_0.translate = ptr_at(buf, wts_tensors[ea_idx + 0].offset);
+        model->dp.flow_0.log_scale = ptr_at(buf, wts_tensors[ea_idx + 1].offset);
     }
 
     /* DP Flows 1..4 (ConvFlow) */
@@ -217,10 +210,10 @@ int load_vtsm(const char *path, VitsModel *model, Vocab *vocab)
         int base = 141 + (fi - 1) * 28;  /* dp.flow.1 starts at 141 */
 
         /* conv_pre: Conv1d(1, 192, 1) → [192, 1, 1] */
-        cp(buf, wts_tensors[base + 0].offset, cf->conv_pre_w, HIDDEN);
-        cp(buf, wts_tensors[base + 1].offset, cf->conv_pre_b, HIDDEN);
+        cf->conv_pre_w = ptr_at(buf, wts_tensors[base + 0].offset);
+        cf->conv_pre_b = ptr_at(buf, wts_tensors[base + 1].offset);
 
-        /* DDS — direct mmap pointers */
+        /* DDS */
         DDS *dds = &cf->dds;
         dds->num_layers = DP_DDS_LAYERS;
         dds->dim = HIDDEN;
@@ -241,8 +234,8 @@ int load_vtsm(const char *path, VitsModel *model, Vocab *vocab)
 
         /* conv_proj: Conv1d(192, 29, 1) */
         int proj_idx = base + 2 + DP_DDS_LAYERS * 8;  /* +26 */
-        cp(buf, wts_tensors[proj_idx + 0].offset, cf->conv_proj_w, WTS_DP_CF_PROJ_W_SIZE);
-        cp(buf, wts_tensors[proj_idx + 1].offset, cf->conv_proj_b, WTS_DP_CF_PROJ_B_SIZE);
+        cf->conv_proj_w = ptr_at(buf, wts_tensors[proj_idx + 0].offset);
+        cf->conv_proj_b = ptr_at(buf, wts_tensors[proj_idx + 1].offset);
     }
 
     /* ============================================================
@@ -255,8 +248,8 @@ int load_vtsm(const char *path, VitsModel *model, Vocab *vocab)
         int base = 253 + fi * 20;  /* flow.0 starts at 253 */
 
         /* conv_pre */
-        cp(buf, wts_tensors[base + 0].offset, cl->conv_pre_w, WTS_FLOW_PRE_W_SIZE);
-        cp(buf, wts_tensors[base + 1].offset, cl->conv_pre_b, WTS_FLOW_PRE_B_SIZE);
+        cl->conv_pre_w = ptr_at(buf, wts_tensors[base + 0].offset);
+        cl->conv_pre_b = ptr_at(buf, wts_tensors[base + 1].offset);
 
         /* WaveNet */
         WaveNet *wn = &cl->wavenet;
@@ -267,18 +260,17 @@ int load_vtsm(const char *path, VitsModel *model, Vocab *vocab)
 
             int o = base + 2 + i * 4;
             /* in_layers: weight already fused */
-            cp(buf, wts_tensors[o + 0].offset, wn->in_w[i], WTS_FLOW_WN_IN_W_SIZE);
-            cp(buf, wts_tensors[o + 1].offset, wn->in_b[i], WTS_FLOW_WN_IN_B_SIZE);
+            wn->in_w[i] = ptr_at(buf, wts_tensors[o + 0].offset);
+            wn->in_b[i] = ptr_at(buf, wts_tensors[o + 1].offset);
             /* res_skip_layers */
-            size_t rs_n = (size_t)rs * HIDDEN;
-            cp(buf, wts_tensors[o + 2].offset, wn->rs_w[i], rs_n);
-            cp(buf, wts_tensors[o + 3].offset, wn->rs_b[i], rs);
+            wn->rs_w[i] = ptr_at(buf, wts_tensors[o + 2].offset);
+            wn->rs_b[i] = ptr_at(buf, wts_tensors[o + 3].offset);
         }
 
         /* conv_post */
         int post_idx = base + 2 + NUM_WAVE * 4;  /* +18 */
-        cp(buf, wts_tensors[post_idx + 0].offset, cl->conv_post_w, WTS_FLOW_POST_W_SIZE);
-        cp(buf, wts_tensors[post_idx + 1].offset, cl->conv_post_b, WTS_FLOW_POST_B_SIZE);
+        cl->conv_post_w = ptr_at(buf, wts_tensors[post_idx + 0].offset);
+        cl->conv_post_b = ptr_at(buf, wts_tensors[post_idx + 1].offset);
     }
 
     /* ============================================================
@@ -362,7 +354,7 @@ int load_vtsm(const char *path, VitsModel *model, Vocab *vocab)
 
         /* conv_post: Conv1d(32, 1, k=7, no bias) */
         int cp_idx = base + 2 + NUM_UP * 2 + 12 * 12;  /* last tensor */
-        cp(buf, wts_tensors[cp_idx].offset, model->decoder.conv_post_w, WTS_DEC_POST_W_SIZE);
+        model->decoder.conv_post_w = ptr_at(buf, wts_tensors[cp_idx].offset);
     }
 
     return 0;

@@ -448,10 +448,11 @@ default 0.01 (`F.leaky_relu(x)` sem argumento).
 | Channel-first `[C][T]` em toda a stack | Consistente com conv1d ops; transformer faz transpose interno |
 | Dims hardcoded (não ler config.json) | Modelo fixo (mms-tts-por), simplifica C |
 | Weight_norm pre-computado no load | WaveNet usa `weight_g`/`weight_v`; HiFi-GAN já vem fused |
-| `.vtsm` flat + offsets no header C | Load = 1 fread + N memcpys; sem parsing, sem mallocs de header |
+| `.vtsm` flat + offsets no header C | Load = 1 mmap + N pointer assignments; sem parsing, sem mallocs |
 | Único formato de pesos (.vtsm) | Pesos sempre exportados via `export_weights.py`; sem parsing de .safetensors em runtime |
+| **100% zero-copy (todos os campos = ponteiros no mmap)** | Struct = 6.4 KB metadata; zero heap para pesos; 1 `munmap` libera tudo |
 | RQS implementado com `softplus` + `softmax` | Mesma fórmula do `_rational_quadratic_spline` do transformers |
-| Stack vs Heap: heap para tudo >64KB | Evita segfault com buffers de 1-18MB |
+| Stack vs Heap: heap para tudo >64KB (buffers temporários) | Evita segfault com buffers de 1-18MB |
 | `#ifdef ENABLE_DUMP` | Dumps são opcionais, não afetam performance de produção |
 | `rand()` (libc) + Box-Muller | Sem dependência externa; seed via `srand()` |
 | `--inject-dir` para validação | Lê `.npy` do Python ref; bypass randn; enables deterministic comparison |
@@ -572,38 +573,56 @@ Gerado a partir do `.safetensors` do HuggingFace via:
 python3 export_weights.py --input model.safetensors --output model.vtsm --header model_weights.h
 ```
 
-### Estratégia de memória: mmap + zero-copy
+### Estratégia de memória: mmap + 100% zero-copy
 
 O loader usa `mmap` (file-backed, `PROT_READ | MAP_PRIVATE`) em vez de
-`malloc` + `fread`. A estratégia é híbrida:
+`malloc` + `fread`. **Todos** os campos de peso no struct `VitsModel`
+são ponteiros que apontam diretamente para a região mapeada — zero memcpy:
 
-| Categoria | Mecanismo | Tamanho | Copy? |
-|-----------|-----------|---------|-------|
-| Pointer fields (LayerNorm, DDS, Conv1d, ConvTranspose1d) | `ptr_at(buf, offset)` — aponta direto no mmap | ~59 MB | **Não** |
-| Inline arrays (embed, attention, FFN, WaveNet, conv_post) | `cp(buf, offset, dst, n)` — memcpy para o struct | ~49 MB | Sim |
+| Propriedade | Valor |
+|-------------|-------|
+| `sizeof(VitsModel)` | 6,584 bytes (6.4 KB) |
+| Memória de pesos (heap) | **0 bytes** — tudo no mmap |
+| Copy no load | **Nenhuma** |
+| `free_model()` | 1 `munmap` |
 
-**Por que não 100% zero-copy?** Os inline arrays são embutidos no struct
-`VitsModel` (alocado via `calloc`). Para eliminá-los seria preciso converter
-todos os campos para ponteiros — um refactor que reduziria o struct a ~15 KB
-de ponteiros e eliminaria os 49 MB de memcpy. Trade-off: perde o struct
-self-contained (sempre depende do mmap estar mapeado) e ganha ~49 MB de RAM.
-Para o Pi 4 (8 GB) o ganho é relevante.
+**Como funciona:**
 
-**Vantagens do mmap vs malloc+fread:**
-- Páginas file-backed são **reclaimable** pelo kernel sob pressão de memória
-  (re-read do disco se necessário) — anonymous heap exigiria swap
-- `free_model()` = 1 `munmap` em vez de 298 `free()` calls
-- Zero allocations heap para pesos — ASAN limpo sem suppression file
+```
+mmap(model.vtsm)  →  região mapeada (108 MB, file-backed, reclaimable)
+                         │
+    embed_w ─────────────┤
+    layers[0].attn.q_w ──┤
+    layers[0].ffn1_w ────┤
+    dp.conv_pre_w ───────┤
+    dp.flows[0].conv_proj_w ──┤
+    flow.flows[0].wavenet.in_w[0] ──┤
+    decoder.conv_post_w ─┤
+    ... (488 ponteiros no total)
+```
 
-**Linha do tempo de memória (Pi 4, texto curto):**
+O struct é alocado com `calloc` (6.4 KB de metadata: ints + pointers).
+O `free_model()` faz `munmap` — todos os ponteiros ficam inválidos
+simultaneamente. O `free(model)` libera os 6.4 KB.
+
+**Vantagens vs malloc+fread (anterior):**
+- **Zero heap para pesos** — ASAN limpo sem suppression file
+- **Páginas file-backed reclaimable** — kernel pode evictar sob pressão
+  (re-read do disco se necessário); anonymous heap exigiria swap
+- **1 `munmap`** libera tudo (antes: 298 `free()`)
+- **Pico de RSS reduzido** — sem 49 MB de struct inline em heap
+- **Cache-friendly** — pages são compartilhadas via page tables; múltiplos
+  processos lendo o mesmo .vtsm compartilham as páginas físicas
+
+**Linha do tempo de memória (texto curto):**
 ```
 open+mmap          →  ~0 MB (page tables only)
-cp() × inline      → ~158 MB (49 MB struct + 109 MB pages faulted)
-inference          → ~158 MB (estável; pages já resident)
-free_model()       →  ~49 MB (munmap libera as 109 MB de pages)
-free(model)        →   ~0 MB
+inference          → ~133 MB (pages faulted sob demanda, file-backed)
+free_model()       →   ~0 MB (munmap libera todas as pages)
+free(model)        →   ~0 MB (6.4 KB struct)
 ```
 
-**Nota:** o `ru_maxrss` (high-water mark) reflete o pico de 158 MB durante
-o load, mas a memória **private** (irreclaimable) é apenas os 49 MB do struct.
-Os 109 MB file-backed podem ser evictados pelo kernel sem swap.
+**Nota:** o `ru_maxrss` (high-water mark) reflete o pico durante o
+inference (~133 MB), mas a memória **private** (irreclaimable) é apenas
+6.4 KB do struct. Todos os 108 MB de pesos são file-backed e podem ser
+evictados pelo kernel sem swap.

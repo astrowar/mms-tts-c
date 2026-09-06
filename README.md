@@ -11,6 +11,7 @@ No runtime dependencies beyond `libc` and `libm`. No Python, no PyTorch, no exte
 | Sampling rate | 16 kHz |
 | Vocab | 43 characters (PT-BR) |
 | Weight format | `.vtsm` (flat binary, ~108 MB) |
+| Weight loading | `mmap` + zero-copy (no memcpy, no heap for weights) |
 | License | CC-BY-NC 4.0 (non-commercial) |
 
 ## Build
@@ -104,7 +105,7 @@ python3 ../validate/compare.py --ref-dir ../ref_out --c-dir ../c_out
 │   │   ├── duration.c      # Stochastic DP (DDS + RQS + ConvFlows)
 │   │   ├── flow.c          # WaveNet + residual coupling flow
 │   │   ├── hifigan.c       # HiFi-GAN vocoder (4× upsample, MRF)
-│   │   ├── vtsm.c          # Weight loader (1 fread + N memcpys)
+│   │   ├── vtsm.c          # Weight loader (mmap, 100% zero-copy)
 │   │   ├── model.c         # Pipeline orchestration
 │   │   ├── npy_reader.c    # Minimal .npy loader (for latent injection)
 │   │   └── wav.c           # WAV writer (16-bit PCM)
@@ -122,12 +123,17 @@ Benchmarked on **Raspberry Pi 4 Model B (8 GB)** — Cortex-A72 @ 1.5 GHz × 4, 
 
 | Build | Text | Audio | Wall time | Peak RSS | RTF |
 |-------|------|-------|-----------|----------|-----|
-| NEON (1 thread) | 3 × ~5.2 s sentences | 15.7 s | 335 s | 218 MB | 21× |
-| NEON + OpenMP × 4 | 3 × ~5.2 s sentences | 15.7 s | 97 s | 218 MB | 5.8× |
-| NEON + OpenMP × 4 | "raspberry pi funcionando e falando" | 2.4 s | 15 s (incl. model load) | 218 MB | ~5× |
-| NEON + OpenMP × 4 | "Olá, mundo!" | 1.3 s | 7 s (incl. model load) | 218 MB | ~2× |
+| NEON (1 thread) | 3 × ~5.2 s sentences | 15.7 s | 335 s | ~133 MB | 21× |
+| NEON + OpenMP × 4 | 3 × ~5.2 s sentences | 15.7 s | 97 s | ~133 MB | 5.8× |
+| NEON + OpenMP × 4 | "raspberry pi funcionando e falando" | 2.4 s | 15 s (incl. model load) | ~133 MB | ~5× |
+| NEON + OpenMP × 4 | "Olá, mundo!" | 1.3 s | 7 s (incl. model load) | ~133 MB | ~2× |
 
-**Memory:** peak RSS is **~218 MB** (109 MB weights + activations + vocoder features).
+**Memory:** peak RSS is **~133 MB** — weights live entirely in the `mmap`'d file
+(file-backed, reclaimable by the kernel). The `VitsModel` struct is only **6.4 KB**
+of pointers + metadata; there is **zero heap allocation** for model weights.
+The ~126 MB of RSS beyond the struct is temporary activation/vocoder buffers
+plus file-backed pages faulted in during inference. Under memory pressure, the
+kernel can evict weight pages without swap — they are re-read from disk on access.
 Comfortably fits in a Pi 4 (8 GB) or Pi 5 (4/8 GB).
 
 **Speedup:** OpenMP 4-thread delivers ~3.6× over single-thread (near-linear; vocoder is the
@@ -143,4 +149,6 @@ dominant bottleneck, encoder/flow parallelize well).
 
 - Non-deterministic by default (stochastic duration predictor). Use `--seed` for reproducible output.
 - `model.vtsm` is not committed (108 MB). Generate with `export_weights.py` or restore from backup.
-- Weight loading is a single `fread` + N `memcpy` calls — no parsing, no runtime transforms.
+- Weight loading is a single `mmap` call — no parsing, no memcpy, no heap allocation for weights.
+  All 488 tensor pointers reference the mapped file region directly. `free_model()` is a
+  single `munmap`.

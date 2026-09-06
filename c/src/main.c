@@ -89,7 +89,7 @@ int main(int argc, char **argv)
 #endif
     }
 
-    /* Load model (heap-allocated: struct is ~100MB) */
+    /* Load model (small struct: ~6.4KB metadata, all weights in mmap) */
     VitsModel *model = (VitsModel *)calloc(1, sizeof(VitsModel));
     if (!model) {
         fprintf(stderr, "Error: out of memory\n");

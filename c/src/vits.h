@@ -84,43 +84,40 @@ typedef struct {
 
 /* Self-attention with relative positions */
 typedef struct {
-    float q_w[HIDDEN * HIDDEN], q_b[HIDDEN];
-    float k_w[HIDDEN * HIDDEN], k_b[HIDDEN];
-    float v_w[HIDDEN * HIDDEN], v_b[HIDDEN];
-    float o_w[HIDDEN * HIDDEN], o_b[HIDDEN];
-    float rel_k[REL_SIZE * HEAD_DIM];
-    float rel_v[REL_SIZE * HEAD_DIM];
+    float *q_w, *q_b;
+    float *k_w, *k_b;
+    float *v_w, *v_b;
+    float *o_w, *o_b;
+    float *rel_k;
+    float *rel_v;
 } Attn;
 
 typedef struct {
     Attn attn;
     /* FFN: Conv1d(192, 768, 3) -> ReLU -> Conv1d(768, 192, 3) */
-    float ffn1_w[FFN_DIM * HIDDEN * FFN_KERNEL];
-    float ffn1_b[FFN_DIM];
-    float ffn2_w[HIDDEN * FFN_DIM * FFN_KERNEL];
-    float ffn2_b[HIDDEN];
+    float *ffn1_w, *ffn1_b;
+    float *ffn2_w, *ffn2_b;
     LayerNorm ln1, ln2;
 } EncLayer;
 
 /* Elementwise affine (DP flow[0]) */
 typedef struct {
-    float translate[DP_CHANNELS];
-    float log_scale[DP_CHANNELS];
+    float *translate;
+    float *log_scale;
 } ElemAffine;
 
 /* RQS coupling layer (DP flows 1..4) */
 typedef struct {
-    float conv_pre_w[HIDDEN], conv_pre_b[HIDDEN];  /* Conv1d(1,192,1) */
+    float *conv_pre_w, *conv_pre_b;           /* Conv1d(1,192,1) */
     DDS dds;
-    float conv_proj_w[(DP_BINS * 3 - 1) * HIDDEN]; /* Conv1d(192, 29, 1) */
-    float conv_proj_b[DP_BINS * 3 - 1];            /* 29 = 10+10+9 */
+    float *conv_proj_w, *conv_proj_b;         /* Conv1d(192, 29, 1) */
 } ConvFlow;
 
 /* Stochastic Duration Predictor */
 typedef struct {
-    float conv_pre_w[HIDDEN * HIDDEN], conv_pre_b[HIDDEN];
+    float *conv_pre_w, *conv_pre_b;
     DDS conv_dds;
-    float conv_proj_w[HIDDEN * HIDDEN], conv_proj_b[HIDDEN];
+    float *conv_proj_w, *conv_proj_b;
     /* Flows for inference (reverse): [ElemAffine, ConvFlow x 4] */
     ElemAffine flow_0;
     ConvFlow  flows[DP_NUM_FLOWS];   /* flows[1..4] */
@@ -130,19 +127,19 @@ typedef struct {
 typedef struct {
     int num_layers;
     /* in_layers[i]: Conv1d(192, 384, 5, dil=1, pad=2) */
-    float in_w[16][384 * HIDDEN * WAVE_KERNEL];
-    float in_b[16][384];
+    float *in_w[NUM_WAVE];
+    float *in_b[NUM_WAVE];
     /* res_skip_layers[i]: Conv1d(192, 384 or 192, 1) */
-    int   rs_out[16];
-    float rs_w[16][384 * HIDDEN];    /* max 384 outputs */
-    float rs_b[16][384];
+    int   rs_out[NUM_WAVE];
+    float *rs_w[NUM_WAVE];
+    float *rs_b[NUM_WAVE];
 } WaveNet;
 
 /* Residual coupling layer (one flow stage) */
 typedef struct {
-    float conv_pre_w[HIDDEN * HALF_FLOW], conv_pre_b[HIDDEN];
+    float *conv_pre_w, *conv_pre_b;
     WaveNet wavenet;
-    float conv_post_w[HALF_FLOW * HIDDEN], conv_post_b[HALF_FLOW];
+    float *conv_post_w, *conv_post_b;
 } CouplingLayer;
 
 typedef struct {
@@ -162,7 +159,7 @@ typedef struct {
     Conv1d conv_pre;          /* 192 -> 512, k=7 */
     ConvTranspose1d up[4];
     ResBlock rb[12];          /* 4 stages x 3 MRF */
-    float conv_post_w[32 * 7];  /* 32 -> 1, k=7, no bias */
+    float *conv_post_w;       /* 32 -> 1, k=7, no bias */
 } HiFiGan;
 
 /* ============================================================
@@ -171,15 +168,15 @@ typedef struct {
 typedef struct {
     int sampling_rate;
 
-    /* mmap'd weight file (for zero-copy pointer fields) */
+    /* mmap'd weight file — all weight pointers point here */
     const unsigned char *vtsm_map;
     size_t vtsm_map_size;
 
     /* Text encoder */
-    float embed_w[VOCAB_SIZE * HIDDEN];
+    float *embed_w;
     EncLayer layers[NUM_LAYERS];
-    float proj_w[HIDDEN * 2 * HIDDEN];  /* Conv1d(192, 384, 1) */
-    float proj_b[2 * HIDDEN];
+    float *proj_w;  /* Conv1d(192, 384, 1) */
+    float *proj_b;
 
     /* Duration predictor */
     StochDP dp;
