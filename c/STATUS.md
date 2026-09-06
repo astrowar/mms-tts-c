@@ -565,10 +565,45 @@ cmake .. -DENABLE_DUMP=ON -DCMAKE_BUILD_TYPE=Debug \
 | VTSM (default) | `./model.vtsm` (diretório atual) | ~108 MB |
 
 O `.vtsm` é o único formato suportado: binário flat com todos os pesos
-pre-processados (weight_norm fused, ConvTranspose transposed). Load = 1 `fread`
-+ N `memcpy`, sem parsing JSON ou transforms em runtime.
+pre-processados (weight_norm fused, ConvTranspose transposed).
 
 Gerado a partir do `.safetensors` do HuggingFace via:
 ```bash
 python3 export_weights.py --input model.safetensors --output model.vtsm --header model_weights.h
 ```
+
+### Estratégia de memória: mmap + zero-copy
+
+O loader usa `mmap` (file-backed, `PROT_READ | MAP_PRIVATE`) em vez de
+`malloc` + `fread`. A estratégia é híbrida:
+
+| Categoria | Mecanismo | Tamanho | Copy? |
+|-----------|-----------|---------|-------|
+| Pointer fields (LayerNorm, DDS, Conv1d, ConvTranspose1d) | `ptr_at(buf, offset)` — aponta direto no mmap | ~59 MB | **Não** |
+| Inline arrays (embed, attention, FFN, WaveNet, conv_post) | `cp(buf, offset, dst, n)` — memcpy para o struct | ~49 MB | Sim |
+
+**Por que não 100% zero-copy?** Os inline arrays são embutidos no struct
+`VitsModel` (alocado via `calloc`). Para eliminá-los seria preciso converter
+todos os campos para ponteiros — um refactor que reduziria o struct a ~15 KB
+de ponteiros e eliminaria os 49 MB de memcpy. Trade-off: perde o struct
+self-contained (sempre depende do mmap estar mapeado) e ganha ~49 MB de RAM.
+Para o Pi 4 (8 GB) o ganho é relevante.
+
+**Vantagens do mmap vs malloc+fread:**
+- Páginas file-backed são **reclaimable** pelo kernel sob pressão de memória
+  (re-read do disco se necessário) — anonymous heap exigiria swap
+- `free_model()` = 1 `munmap` em vez de 298 `free()` calls
+- Zero allocations heap para pesos — ASAN limpo sem suppression file
+
+**Linha do tempo de memória (Pi 4, texto curto):**
+```
+open+mmap          →  ~0 MB (page tables only)
+cp() × inline      → ~158 MB (49 MB struct + 109 MB pages faulted)
+inference          → ~158 MB (estável; pages já resident)
+free_model()       →  ~49 MB (munmap libera as 109 MB de pages)
+free(model)        →   ~0 MB
+```
+
+**Nota:** o `ru_maxrss` (high-water mark) reflete o pico de 158 MB durante
+o load, mas a memória **private** (irreclaimable) é apenas os 49 MB do struct.
+Os 109 MB file-backed podem ser evictados pelo kernel sem swap.
