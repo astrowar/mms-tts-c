@@ -69,7 +69,7 @@ O script `export_weights.py` gera:
 
 ```
 mms-tts-por/c/
-├── Makefile
+├── CMakeLists.txt         # Build: auto-detecta arch (x86_64/AVX2, ARM64/NEON, ARMv7/NEON)
 ├── STATUS.md              ← este arquivo
 ├── export_weights.py      # Python: safetensors → .vtsm + .h
 ├── model.vtsm             # Pesos binários (gerado)
@@ -77,7 +77,9 @@ mms-tts-por/c/
 ├── src/
 │   ├── vits.h             # Structs, constantes, declarações
 │   ├── main.c             # CLI (--inject-dir, --dump-dir, etc.)
-│   ├── ops.c              # conv1d, conv_transpose1d, depthwise, layernorm, activations
+│   ├── ops_base.c         # Ops escalar: conv1d, conv_transpose1d, depthwise, layernorm
+│   ├── ops_neon.c         # Ops otimizados NEON (aarch64 / ARMv7)
+│   ├── ops_avx.c          # Ops otimizados AVX2/FMA (x86_64)
 │   ├── tokenizer.c        # text → token IDs (UTF-8, lowercase, add_blank)
 │   ├── encoder.c          # Transformer encoder (6 layers, relative position)
 │   ├── duration.c         # Stochastic Duration Predictor (DDS + RQS)
@@ -149,11 +151,11 @@ text
 | Constantes/Structs | `vits.h` | Todas dims hardcoded para mms-tts-por (vocab=43, hidden=192, etc.) |
 | Weight layout | `model_weights.h` | 488 tensores com offset/size, 18 seções, constants `WTS_*` |
 | Exporter | `export_weights.py` | Safetensors → .vtsm (flat) + .h (layout C) |
-| Conv1d | `ops.c` | Suporta dilation, padding, depthwise |
-| ConvTranspose1d | `ops.c` | Scatter com stride (upsampling) |
-| LayerNorm | `ops.c` | Channel-first, eps=1e-5 |
-| GELU / LeakyReLU / tanh / sigmoid | `ops.c` | In-place |
-| randn (Box-Muller) | `ops.c` | Com spare para eficiência |
+| Conv1d | `ops_{base,neon,avx}.c` | Suporta dilation, padding, depthwise; SIMD dispatch por arch |
+| ConvTranspose1d | `ops_{base,neon,avx}.c` | Scatter com stride (upsampling) |
+| LayerNorm | `ops_{base,neon,avx}.c` | Channel-first, eps=1e-5 |
+| GELU / LeakyReLU / tanh / sigmoid | `ops_{base,neon,avx}.c` | In-place |
+| randn (Box-Muller) | `ops_{base,neon,avx}.c` | Com spare para eficiência |
 | Tokenizer | `tokenizer.c` | UTF-8, lowercase, vocab 43, filter non-vocab, strip, add_blank |
 | WAV writer | `wav.c` | 16-bit PCM mono, normaliza por peak |
 | Encoder | `encoder.c` | 6 layers, multi-head attn (2h×96d), relative pos, ConvFFN |
@@ -163,7 +165,7 @@ text
 | VTSM loader | `vtsm.c` | memcpy direto de offsets; sem parsing, sem transforms |
 | Pipeline | `model.c` | Orquestra todos os stages, dump hooks condicionais |
 | CLI | `main.c` | --text, --output, --model, --seed, --multi, --dump-dir, --inject-dir |
-| Makefile | `Makefile` | Targets: all, run, validate, clean; DUMP=1 flag |
+| Build | `CMakeLists.txt` | Auto-detecta arch; flags: ENABLE_OMP, ENABLE_DUMP |
 
 ### ✅ Scripts de Validação
 
@@ -179,13 +181,14 @@ text
 cd mms-tts-por/c
 
 # 1. Build C com dumps
-make clean && make DUMP=1 CFLAGS="-g -O0 -Wall -Wextra -Wno-unused-parameter -DENABLE_DUMP"
+mkdir -p build && cd build
+cmake .. -DENABLE_DUMP=ON -DCMAKE_BUILD_TYPE=Debug && make -j$(nproc)
 
 # 2. Gerar referência Python (inclui WAV para verificação auditiva)
 python3 validate/stages_ref.py --text "ola, mundo, tudo bem ?" --seed 42 --out-dir ref_out
 
 # 3. Rodar C com dumps
-./mms-tts --text "ola, mundo, tudo bem ?" --seed 42 --dump-dir c_out
+../build/mms-tts --text "ola, mundo, tudo bem ?" --seed 42 --dump-dir c_out
 
 # 4. Comparar
 python3 validate/compare.py --ref-dir ref_out --c-dir c_out
@@ -205,7 +208,7 @@ python3 validate/compare.py --ref-dir ref_out --c-dir c_out
 | 8 | **DP: ConvFlow sem global_conditioning** | `convflow_reverse` não adicionava o condicionamento global (output de conv_pre+DDS+conv_proj do DP) à entrada do DDS interno de cada ConvFlow | Adicionar parâmetro `global_cond` e somar ao output de `conv_pre` | `duration.c` |
 | 9 | **RQS: múltiplos erros de fórmula** | (a) Falta `1/√192` scaling no output de conv_proj; (b) min scaling usava `(1-2*min*bin)` em vez de `(1-min*bin)`; (c) `delta` usava `(u[b]+u[b+1])*0.5` em vez de `h[b]/w[b]`; (d) `intermediate1` usava `h*(delta-1)` em vez de `u[b]+u[b+1]-2*delta`; (e) busca de bin usava `cumwidths` em vez de `cumheights`; (f) derivada de fronteira usava -0.4587 em vez de 1.0 | Reescrita completa de `rqs_prepare` e `rqs_reverse_one` seguindo a fórmula exata de `_rational_quadratic_spline` do transformers | `duration.c` |
 | 10 | **Mask: blanks tratados como padding** | C usava `mask[t] = (ids[t] != 0)`, zerando posições de blank (add_blank). No VITS, o attention mask é só para batch padding — blanks participam normalmente | `mask[t] = 1` para todos | `model.c` |
-| 11 | **HiFi-GAN: ConvTranspose1d sem padding** | Upsamplers usam padding (4,4,1,1). Sem isso, output length era `(T-1)*stride+k` em vez de `(T-1)*stride+k-2*pad`, causando OOB write | Adicionar campo `pad` ao struct; op calcula `oT = (T-1)*stride - 2*pad + k` e faz bounds check | `ops.c`, `vits.h`, `vtsm.c` |
+| 11 | **HiFi-GAN: ConvTranspose1d sem padding** | Upsamplers usam padding (4,4,1,1). Sem isso, output length era `(T-1)*stride+k` em vez de `(T-1)*stride+k-2*pad`, causando OOB write | Adicionar campo `pad` ao struct; op calcula `oT = (T-1)*stride - 2*pad + k` e faz bounds check | `ops_*.c`, `vits.h`, `vtsm.c` |
 | 12 | **HiFi-GAN: buffer insuficiente** | `max_size = 32 * wave_len` não cobria o overshoot do kernel (ex: stage 0 gera `T*8+7` samples) | `max_size = 32 * wave_len + 8192` | `hifigan.c` |
 | 13 | **Ref: expansão do prior na direção errada** | `stages_ref.py` usava `F.pad(valid, (1,0,0,0))[:, :-1]` — shift na dimensão **mel** (colunas) em vez de **T** (linhas). Produzia valores ±1 em vez de one-hot → prior expansion totalmente incorreto | `F.pad(valid, (0,0,1,0))[:-1, :]` — shift na dimensão T, matching `F.pad(valid, [0,0,1,0,0,0])[:, :-1]` do `model.forward()` | `validate/stages_ref.py` |
 | 14 | **Ref: re-seed desnecessário no stage 4** | `stages_ref.py` chamava `torch.manual_seed(seed+1)` antes de gerar noise no stage 4, mas o `model.forward()` não re-seeda — o RNG continua do state pós-DP | Remover o re-seed; o RNG natural após o DP randn produz os mesmos valores do E2E | `validate/stages_ref.py` |
@@ -220,7 +223,7 @@ python3 validate/compare.py --ref-dir ref_out --c-dir c_out
 
 | # | Tarefa | Status |
 |---|--------|--------|
-| A | Build limpo (`make DUMP=1` sem errors) | ✅ Compila; ASAN limpo (só leaks de pesos — by design) |
+| A | Build limpo (`-DENABLE_DUMP=ON` sem errors) | ✅ Compila; ASAN limpo (só leaks de pesos — by design) |
 | B | Smoke test (gerar WAV sem crash) | ✅ Completa sem crash (ASAN clean) |
 | C | Validar Stage 1 (tokenizer) | ✅ Token IDs idênticos (T=37); mask idêntico |
 | D | Validar Stage 2 (encoder) | ✅ `02_hidden_cf` rel=3.8e-7, `prior_means` rel=1.7e-7, `prior_log_vars` rel=6e-7 |
@@ -536,20 +539,24 @@ make
 python3 validate/compare.py --ref-dir ref_out --c-dir c_out
 
 # Build com debug + dumps
-make clean && make DUMP=1 CFLAGS="-g -O0 -Wall -Wextra -Wno-unused-parameter -DENABLE_DUMP"
+mkdir -p build && cd build
+cmake .. -DENABLE_DUMP=ON -DCMAKE_BUILD_TYPE=Debug && make -j$(nproc)
 
 # Build com AddressSanitizer (debug)
-make clean && make DUMP=1 \
-    CFLAGS="-O0 -g -fsanitize=address -Wall -Wextra -Wno-unused-parameter -DENABLE_DUMP" \
-    LDFLAGS="-lm -fsanitize=address"
+mkdir -p build_asan && cd build_asan
+cmake .. -DENABLE_DUMP=ON -DCMAKE_BUILD_TYPE=Debug \
+    -DCMAKE_C_FLAGS="-O0 -g -fsanitize=address -Wall -Wextra -Wno-unused-parameter" \
+    -DCMAKE_EXE_LINKER_FLAGS="-fsanitize=address" && make -j$(nproc)
 
 # Validação stage-by-stage (automated)
-make validate
+# 1. python3 validate/stages_ref.py --text "..." --seed 42 --out-dir ref_out
+# 2. ./build/mms-tts --text "..." --seed 42 --inject-dir ref_out --dump-dir c_out
+# 3. python3 validate/compare.py --ref-dir ref_out --c-dir c_out
 ```
 
-> **Nota:** Ao sobrescrever `CFLAGS` na linha de comando, o make não adiciona
-> `-DENABLE_DUMP` automaticamente (variáveis de CLI não podem ser modificadas
-> pelo Makefile). Sempre incluir `-DENABLE_DUMP` manualmente.
+> **Nota:** Para build de validação, usar `cmake .. -DENABLE_DUMP=ON`.
+> O flag é necessário para compilar `validate/dump.c` e ativar os hooks de dump
+> em `model.c`.
 
 ## Modelo
 
