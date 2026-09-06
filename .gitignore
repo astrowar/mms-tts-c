@@ -1,0 +1,22 @@
+# Build artifacts
+*.o
+c/mms-tts
+
+# Model weights (108MB, regenerate with export_weights.py)
+c/model.vtsm
+
+# Validation outputs (regenerate with make validate)
+c/ref_out/
+c/c_out/
+
+# Generated audio
+*.wav
+
+# Python
+__pycache__/
+*.pyc
+
+# Editor
+*.swp
+.vscode/
+.idea/
