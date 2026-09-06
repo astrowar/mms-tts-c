@@ -45,14 +45,7 @@ static void dds_forward(const DDS *d, const float *in, int T,
         layer_norm(buf2, T, dim, &d->norm2[i], buf2);
         gelu(buf2, (int)n);
 
-        for (int c = 0; c < dim; c++) {
-            for (int t = 0; t < T; t++) {
-                if (mask && !mask[t])
-                    out[(size_t)c * T + t] = 0.0f;
-                else
-                    out[(size_t)c * T + t] += buf2[(size_t)c * T + t];
-            }
-        }
+        masked_axpy_f(out, buf2, mask, dim, T);
     }
     free(buf);
     free(buf2);
@@ -72,20 +65,6 @@ static float softplus_f(float x)
     if (x > 20.0f) return x;
     if (x < -20.0f) return 0.0f;
     return logf(1.0f + expf(x));
-}
-
-static void softmax_f(float *x, int n)
-{
-    float maxv = x[0];
-    for (int i = 1; i < n; i++)
-        if (x[i] > maxv) maxv = x[i];
-    float sum = 0.0f;
-    for (int i = 0; i < n; i++) {
-        x[i] = expf(x[i] - maxv);
-        sum += x[i];
-    }
-    for (int i = 0; i < n; i++)
-        x[i] /= sum;
 }
 
 /*
@@ -227,34 +206,30 @@ static void convflow_reverse(const ConvFlow *cf, float *x, int T,
     const float *first_half = x; /* [1][T] = x[0..T-1] */
 
     /* conv_pre: Conv1d(1, 192, 1), then add global conditioning */
-    for (int c = 0; c < HIDDEN; c++) {
-        float b = cf->conv_pre_b[c];
-        for (int t = 0; t < T; t++) {
-            if (mask && !mask[t]) {
-                cond_buf[(size_t)c * T + t] = 0.0f;
-            } else {
-                float v = b + cf->conv_pre_w[c] * first_half[t];
-                v += global_cond[(size_t)c * T + t];
-                cond_buf[(size_t)c * T + t] = v;
-            }
-        }
+    {
+        Conv1d cp = {
+            .in_ch = 1, .out_ch = HIDDEN, .k = 1,
+            .pad = 0, .dilation = 1,
+            .weight = cf->conv_pre_w, .bias = cf->conv_pre_b
+        };
+        conv1d(first_half, 1, T, &cp, cond_buf);
     }
+    axpy_f(cond_buf, global_cond, (int)(HIDDEN * (size_t)T));
+    mask_zero_f(cond_buf, mask, HIDDEN, T);
 
     /* DDS on conditioning (in-place) */
     dds_forward(&cf->dds, cond_buf, T, mask, cond_buf);
 
     /* conv_proj: Conv1d(192, 29, 1) */
-    for (int o = 0; o < out_ch; o++) {
-        float b = cf->conv_proj_b[o];
-        for (int t = 0; t < T; t++) {
-            float s = b;
-            for (int c = 0; c < HIDDEN; c++)
-                s += cf->conv_proj_w[(size_t)o * HIDDEN + c] *
-                     cond_buf[(size_t)c * T + t];
-            proj_buf[(size_t)o * T + t] =
-                (mask && !mask[t]) ? 0.0f : s;
-        }
+    {
+        Conv1d cp = {
+            .in_ch = HIDDEN, .out_ch = out_ch, .k = 1,
+            .pad = 0, .dilation = 1,
+            .weight = cf->conv_proj_w, .bias = cf->conv_proj_b
+        };
+        conv1d(cond_buf, HIDDEN, T, &cp, proj_buf);
     }
+    mask_zero_f(proj_buf, mask, out_ch, T);
 
     /* Prepare RQS params */
     rqs_prepare(proj_buf, T, widths, cumw, heights, cumh, derivs);
@@ -360,9 +335,7 @@ void dp_reverse(const StochDP *dp,
         conv1d(dds_out, HIDDEN, T, &pc, cond_buf);
     }
 
-    for (int c = 0; c < HIDDEN; c++)
-        for (int t = 0; t < T; t++)
-            if (mask && !mask[t]) cond_buf[(size_t)c * T + t] = 0.0f;
+    mask_zero_f(cond_buf, mask, HIDDEN, T);
 
 #ifdef ENABLE_DUMP
     if (dp_dump_dir) {

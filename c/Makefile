@@ -15,6 +15,11 @@ SRC_DIR  = src
 VAL_DIR  = validate
 BIN      = mms-tts
 
+ifneq ($(OMP),)
+  CFLAGS  += -fopenmp
+  LDFLAGS += -fopenmp
+endif
+
 SRCS = $(SRC_DIR)/main.c \
        $(SRC_DIR)/ops.c \
        $(SRC_DIR)/tokenizer.c \

@@ -121,18 +121,15 @@ void hifigan_forward(const HiFiGan *dec,
                 conv1d(E, new_ch, new_T, &rb->c2[d], C);
 
                 /* C = C + D (residual connection) */
-                for (size_t idx = 0; idx < new_size; idx++)
-                    C[idx] += D[idx];
+                axpy_f(C, D, (int)new_size);
             }
 
             /* Accumulate: A += C */
-            for (size_t idx = 0; idx < new_size; idx++)
-                A[idx] += C[idx];
+            axpy_f(A, C, (int)new_size);
         }
 
         /* Divide by 3 */
-        for (size_t idx = 0; idx < new_size; idx++)
-            A[idx] /= 3.0f;
+        scal_f(A, (int)new_size, 1.0f / 3.0f);
 
 #ifdef ENABLE_DUMP
         if (dump_this_call && hifi_dump_dir) {
@@ -156,21 +153,15 @@ void hifigan_forward(const HiFiGan *dec,
 
     /*
      * conv_post: Conv1d(32, 1, k=7, pad=3, no bias)
-     * Weight layout: [32][7]  (in_ch * k)
-     * We only need the first wave_len output samples.
      */
-    for (int t = 0; t < wave_len; t++) {
-        float acc = 0.0f;
-        for (int i = 0; i < cur_ch; i++) {
-            const float *in_c = A + (size_t)i * cur_T;
-            const float *w = dec->conv_post_w + (size_t)i * 7;
-            for (int j = 0; j < 7; j++) {
-                int idx = t + j - 3;
-                if (idx >= 0 && idx < cur_T)
-                    acc += w[j] * in_c[idx];
-            }
-        }
-        wave[t] = acc;
+    {
+        static const float zero_bias = 0.0f;
+        Conv1d cp = {
+            .in_ch = cur_ch, .out_ch = 1, .k = 7,
+            .pad = 3, .dilation = 1,
+            .weight = (float *)dec->conv_post_w, .bias = (float *)&zero_bias
+        };
+        conv1d(A, cur_ch, cur_T, &cp, wave);
     }
 
     *wave_T = wave_len;

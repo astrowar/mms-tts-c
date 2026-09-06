@@ -74,13 +74,7 @@ static void wavenet_forward(const WaveNet *wn, const float *input, int T,
         conv1d(inp, C, T, &ic, hidden);
 
         /* Gating: tanh * sigmoid */
-        for (int c = 0; c < C; c++) {
-            for (int t = 0; t < T; t++) {
-                float tv = tanhf(hidden[(size_t)c * T + t]);
-                float sv = 1.0f / (1.0f + expf(-hidden[(size_t)(C + c) * T + t]));
-                acts[(size_t)c * T + t] = tv * sv;
-            }
-        }
+        gating_f(hidden, hidden + C * T, acts, (int)cT);
 
         /* res_skip: Conv1d(192, rs_out[i], 1) */
         Conv1d rsc = {
@@ -91,18 +85,10 @@ static void wavenet_forward(const WaveNet *wn, const float *input, int T,
         conv1d(acts, C, T, &rsc, rs);
 
         if (i < wn->num_layers - 1) {
-            for (int c = 0; c < C; c++)
-                for (int t = 0; t < T; t++)
-                    inp[(size_t)c * T + t] =
-                        (mask && !mask[t]) ? 0.0f :
-                        inp[(size_t)c * T + t] + rs[(size_t)c * T + t];
-            for (int c = 0; c < C; c++)
-                for (int t = 0; t < T; t++)
-                    output[(size_t)c * T + t] += rs[(size_t)(C + c) * T + t];
+            masked_axpy_f(inp, rs, mask, C, T);
+            axpy_f(output, rs + C * T, (int)cT);
         } else {
-            for (int c = 0; c < C; c++)
-                for (int t = 0; t < T; t++)
-                    output[(size_t)c * T + t] += rs[(size_t)c * T + t];
+            axpy_f(output, rs, (int)cT);
         }
 
 #ifdef ENABLE_DUMP
@@ -120,9 +106,7 @@ static void wavenet_forward(const WaveNet *wn, const float *input, int T,
     }
 
     /* Apply mask to output */
-    for (int c = 0; c < C; c++)
-        for (int t = 0; t < T; t++)
-            if (mask && !mask[t]) output[(size_t)c * T + t] = 0.0f;
+    mask_zero_f(output, mask, C, T);
 
     free(inp);
     free(hidden);
@@ -152,9 +136,7 @@ static void coupling_reverse(const CouplingLayer *cl, float *latents, int T,
         };
         conv1d(latents, half, T, &cp, hidden);
     }
-    for (int c = 0; c < HIDDEN; c++)
-        for (int t = 0; t < T; t++)
-            if (mask && !mask[t]) hidden[(size_t)c * T + t] = 0.0f;
+    mask_zero_f(hidden, mask, HIDDEN, T);
 
     /* WaveNet (in-place: hidden -> hidden) */
     wavenet_forward(&cl->wavenet, hidden, T, mask, hidden);
@@ -168,9 +150,7 @@ static void coupling_reverse(const CouplingLayer *cl, float *latents, int T,
         };
         conv1d(hidden, HIDDEN, T, &cp, mean);
     }
-    for (int c = 0; c < half; c++)
-        for (int t = 0; t < T; t++)
-            if (mask && !mask[t]) mean[(size_t)c * T + t] = 0.0f;
+    mask_zero_f(mean, mask, half, T);
 
     /* Reverse: second_half -= mean */
     float *second = latents + halfT;

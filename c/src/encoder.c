@@ -3,23 +3,6 @@
 #include <stdlib.h>
 
 /* ============================================================
- * Softmax over a row of length n
- * ============================================================ */
-static void softmax_row(float *row, int n)
-{
-    float maxv = row[0];
-    for (int i = 1; i < n; i++)
-        if (row[i] > maxv) maxv = row[i];
-    float sum = 0.0f;
-    for (int i = 0; i < n; i++) {
-        row[i] = expf(row[i] - maxv);
-        sum += row[i];
-    }
-    for (int i = 0; i < n; i++)
-        row[i] /= sum;
-}
-
-/* ============================================================
  * Attention forward (all heads, single batch)
  *
  * x: [HIDDEN][T]  (channel-first)
@@ -89,7 +72,7 @@ static void attention_forward(const Attn *a, const float *x, int T,
                 if (mask && !mask[j])
                     attn[i * T + j] = -1e10f;
             }
-            softmax_row(attn + i * T, T);
+            softmax_f(attn + i * T, T);
         }
 
         /* Output: attn @ V, accumulate into full o at head offset */
@@ -149,12 +132,8 @@ static void ffn_forward(const EncLayer *layer, const float *x, int T,
         .weight = (float *)layer->ffn1_w, .bias = (float *)layer->ffn1_b
     };
     conv1d(x, HIDDEN, T, &c1, tmp);
-
-    for (size_t i = 0; i < fT; i++)
-        if (tmp[i] < 0.0f) tmp[i] = 0.0f;
-    for (int c = 0; c < FFN_DIM; c++)
-        for (int t = 0; t < T; t++)
-            if (mask && !mask[t]) tmp[(size_t)c * T + t] = 0.0f;
+    relu_f(tmp, (int)fT);
+    mask_zero_f(tmp, mask, FFN_DIM, T);
 
     Conv1d c2 = {
         .in_ch = FFN_DIM, .out_ch = HIDDEN, .k = FFN_KERNEL,
@@ -162,10 +141,7 @@ static void ffn_forward(const EncLayer *layer, const float *x, int T,
         .weight = (float *)layer->ffn2_w, .bias = (float *)layer->ffn2_b
     };
     conv1d(tmp, FFN_DIM, T, &c2, out);
-
-    for (int c = 0; c < HIDDEN; c++)
-        for (int t = 0; t < T; t++)
-            if (mask && !mask[t]) out[(size_t)c * T + t] = 0.0f;
+    mask_zero_f(out, mask, HIDDEN, T);
 
     free(tmp);
 }
@@ -200,14 +176,12 @@ void encoder_forward(const VitsModel *m,
         const EncLayer *layer = &m->layers[l];
 
         attention_forward(&layer->attn, x, T, mask, tmp);
-        for (size_t i = 0; i < hT; i++)
-            x[i] += tmp[i];
+        axpy_f(x, tmp, (int)hT);
         layer_norm(x, T, HIDDEN, &layer->ln1, tmp);
         memcpy(x, tmp, hT * sizeof(float));
 
         ffn_forward(layer, x, T, mask, tmp);
-        for (size_t i = 0; i < hT; i++)
-            x[i] += tmp[i];
+        axpy_f(x, tmp, (int)hT);
         layer_norm(x, T, HIDDEN, &layer->ln2, tmp);
         memcpy(x, tmp, hT * sizeof(float));
     }
@@ -222,18 +196,13 @@ void encoder_forward(const VitsModel *m,
     };
     conv1d(hidden, HIDDEN, T, &pc, proj);
 
-    for (int t = 0; t < T; t++) {
+    for (int t = 0; t < T; t++)
         for (int c = 0; c < HIDDEN; c++) {
             prior_means[c * T + t] = proj[(size_t)c * T + t];
             prior_log_vars[c * T + t] = proj[(size_t)(HIDDEN + c) * T + t];
         }
-        if (mask && !mask[t]) {
-            for (int c = 0; c < HIDDEN; c++) {
-                prior_means[c * T + t] = 0;
-                prior_log_vars[c * T + t] = 0;
-            }
-        }
-    }
+    mask_zero_f(prior_means, mask, HIDDEN, T);
+    mask_zero_f(prior_log_vars, mask, HIDDEN, T);
 
     free(x);
     free(tmp);

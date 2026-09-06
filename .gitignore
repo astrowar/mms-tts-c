@@ -1,6 +1,7 @@
 # Build artifacts
 *.o
 c/mms-tts
+c/build*/
 
 # Model weights (108MB, regenerate with export_weights.py)
 c/model.vtsm

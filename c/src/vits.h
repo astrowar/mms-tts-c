@@ -214,6 +214,13 @@ void gelu(float *x, int n);
 void leaky_relu_f(float *x, int n, float slope);
 void tanh_f(float *x, int n);
 void sigmoid_f(float *x, int n);
+void relu_f(float *x, int n);
+void softmax_f(float *x, int n);
+void gating_f(const float *lo, const float *hi, float *out, int n);
+void mask_zero_f(float *x, const int *mask, int C, int T);
+void masked_axpy_f(float *dst, const float *src, const int *mask, int C, int T);
+void axpy_f(float *dst, const float *src, int n);
+void scal_f(float *x, int n, float alpha);
 float randn_f(void);
 
 /* --- vtsm.c --- */
