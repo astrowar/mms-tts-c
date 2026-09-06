@@ -129,12 +129,10 @@ int main(int argc, char **argv)
         n_texts++;
     }
 
-    /* Synthesize */
-    float *waveform = (float *)malloc(sizeof(float) * MAX_WAV_LEN);
-    if (!waveform) {
-        fprintf(stderr, "Error: out of memory\n");
-        return 1;
-    }
+    /* Synthesize all texts, then free weights, then write WAVs */
+    float *waveforms[8] = {0};
+    int wave_lens[8] = {0};
+    int sample_rate = model->sampling_rate;
 
     for (int i = 0; i < n_texts; i++) {
         int display_len = (int)strlen(texts[i]);
@@ -142,27 +140,39 @@ int main(int argc, char **argv)
         printf("[%d/%d] \"%s%s\"\n", i + 1, n_texts, texts[i],
                (int)strlen(texts[i]) > 60 ? "..." : "");
 
-        int wave_len = 0;
-        if (vits_synthesize(model, &vocab, texts[i], seed, inject_dir, waveform, &wave_len) != 0) {
+        waveforms[i] = (float *)malloc(sizeof(float) * MAX_WAV_LEN);
+        if (!waveforms[i]) {
+            fprintf(stderr, "Error: out of memory\n");
+            for (int j = 0; j < i; j++) free(waveforms[j]);
+            free_model(model);
+            free(model);
+            return 1;
+        }
+
+        if (vits_synthesize(model, &vocab, texts[i], seed, inject_dir, waveforms[i], &wave_lens[i]) != 0) {
             fprintf(stderr, "  Error: synthesis failed\n");
-            free(waveform);
+            free(waveforms[i]);
+            for (int j = 0; j < i; j++) free(waveforms[j]);
+            free_model(model);
             free(model);
             return 1;
         }
 
-        if (write_wav16(outputs[i], waveform, wave_len, model->sampling_rate) != 0) {
-            fprintf(stderr, "  Error: failed to write %s\n", outputs[i]);
-            free(waveform);
-            free(model);
-            return 1;
-        }
-
-        double duration = (double)wave_len / model->sampling_rate;
+        double duration = (double)wave_lens[i] / sample_rate;
         printf("  -> %s (%.2fs)\n", outputs[i], duration);
     }
 
-    free(waveform);
+    /* Free model weights before writing WAVs to minimize peak memory */
+    free_model(model);
     free(model);
+
+    for (int i = 0; i < n_texts; i++) {
+        if (write_wav16(outputs[i], waveforms[i], wave_lens[i], sample_rate) != 0) {
+            fprintf(stderr, "  Error: failed to write %s\n", outputs[i]);
+        }
+        free(waveforms[i]);
+    }
+
     printf("Done.\n");
     return 0;
 }

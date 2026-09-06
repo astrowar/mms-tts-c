@@ -224,7 +224,8 @@ void scal_f(float *x, int n, float alpha);
 float randn_f(void);
 
 /* --- vtsm.c --- */
-int load_vtsm(const char *path, VitsModel *model, Vocab *vocab);
+int  load_vtsm(const char *path, VitsModel *model, Vocab *vocab);
+void free_model(VitsModel *model);
 
 /* --- tokenizer.c --- */
 void vocab_init(Vocab *v);

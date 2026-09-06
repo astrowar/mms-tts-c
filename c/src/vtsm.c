@@ -406,3 +406,68 @@ int load_vtsm(const char *path, VitsModel *model, Vocab *vocab)
     free(buf);
     return 0;
 }
+
+/* ============================================================
+ * Free all heap-allocated weight pointers within the model.
+ * Call before free(model) to release individual tensor buffers.
+ * ============================================================ */
+void free_model(VitsModel *model)
+{
+    if (!model) return;
+
+    /* Encoder: LayerNorms per layer */
+    for (int l = 0; l < NUM_LAYERS; l++) {
+        free(model->layers[l].ln1.weight);
+        free(model->layers[l].ln1.bias);
+        free(model->layers[l].ln2.weight);
+        free(model->layers[l].ln2.bias);
+    }
+
+    /* Duration Predictor: DDS */
+    DDS *dds = &model->dp.conv_dds;
+    for (int i = 0; i < DP_DDS_LAYERS; i++) {
+        free(dds->dw_w[i]);
+        free(dds->dw_b[i]);
+        free(dds->pw_w[i]);
+        free(dds->pw_b[i]);
+        free(dds->norm1[i].weight);
+        free(dds->norm1[i].bias);
+        free(dds->norm2[i].weight);
+        free(dds->norm2[i].bias);
+    }
+
+    /* Duration Predictor: ConvFlows (4) each with internal DDS */
+    for (int fi = 0; fi < DP_NUM_FLOWS; fi++) {
+        DDS *cf_dds = &model->dp.flows[fi].dds;
+        for (int i = 0; i < DP_DDS_LAYERS; i++) {
+            free(cf_dds->dw_w[i]);
+            free(cf_dds->dw_b[i]);
+            free(cf_dds->pw_w[i]);
+            free(cf_dds->pw_b[i]);
+            free(cf_dds->norm1[i].weight);
+            free(cf_dds->norm1[i].bias);
+            free(cf_dds->norm2[i].weight);
+            free(cf_dds->norm2[i].bias);
+        }
+    }
+
+    /* HiFi-GAN: conv_pre */
+    free(model->decoder.conv_pre.weight);
+    free(model->decoder.conv_pre.bias);
+
+    /* HiFi-GAN: upsample layers */
+    for (int i = 0; i < NUM_UP; i++) {
+        free(model->decoder.up[i].weight);
+        free(model->decoder.up[i].bias);
+    }
+
+    /* HiFi-GAN: ResBlocks (4 stages × 3 kernels × 3 dilations × 2 convs × {w,b}) */
+    for (int i = 0; i < 12; i++) {
+        for (int d = 0; d < RF_DILS; d++) {
+            free(model->decoder.rb[i].c1[d].weight);
+            free(model->decoder.rb[i].c1[d].bias);
+            free(model->decoder.rb[i].c2[d].weight);
+            free(model->decoder.rb[i].c2[d].bias);
+        }
+    }
+}
