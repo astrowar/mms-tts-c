@@ -4,16 +4,31 @@ Export MMS TTS (mms-tts-por) weights from safetensors to:
   1. A flat binary file (.vtsm) with all model weights
   2. A C header file (.h) describing the binary layout
 
-The .vtsm format:
+The .vtsm format (v1):
   Offset  Size  Field
   ------  ----  ----------------------------------------------------------
   0       4     magic bytes "VTSM"
-  4       4     version (uint32 LE)
+  4       4     version (uint32 LE) = 1
   8       4     vocab_size (uint32 LE)
   12      4     hidden_size (uint32 LE)
   16      8     total_data_size in bytes (uint64 LE)
   24      8     reserved (zero)
   32      ...   sequential float32 tensor data
+
+The .vtsm format (v2, with --int8):
+  Offset  Size  Field
+  ------  ----  ----------------------------------------------------------
+  0       4     magic bytes "VTSM"
+  4       4     version (uint32 LE) = 2
+  8       4     vocab_size (uint32 LE)
+  12      4     hidden_size (uint32 LE)
+  16      8     total_data_size in bytes (uint64 LE) [F32 data only]
+  24      8     qdata_size (uint64 LE) [int8 element count]
+  32      8     n_scales (uint64 LE) [float32 scale count]
+  40      8     reserved (zero)
+  48      ...   sequential float32 tensor data
+  ...     ...   int8 HiFi-GAN weight data (qdata_size bytes)
+  ...     ...   float32 per-channel scales (n_scales * 4 bytes)
 
 The generated .h defines:
   - Size constants for each tensor
@@ -144,6 +159,63 @@ def transpose_convT(tensors: dict, base: str) -> np.ndarray:
     """[in,out,k] -> [out,in,k]"""
     w = tensors[base + ".weight"]
     return np.transpose(w, (1, 0, 2))
+
+
+# ============================================================
+# Int8 quantization for HiFi-GAN (per-output-channel symmetric)
+# ============================================================
+QMAX = 127
+
+
+def quantize_conv_w(w: np.ndarray) -> Tuple[np.ndarray, np.ndarray]:
+    """Quantize a [out_ch, in_ch, k] weight tensor.
+    Returns (int8_data, scales) where scales is [out_ch]."""
+    out_ch = w.shape[0]
+    scales = np.zeros(out_ch, dtype=np.float32)
+    q = np.zeros_like(w, dtype=np.int8)
+    for o in range(out_ch):
+        max_val = np.max(np.abs(w[o].astype(np.float32)))
+        s = max_val / QMAX if max_val > 1e-10 else 1.0
+        scales[o] = s
+        q[o] = np.clip(np.round(w[o] / s), -QMAX - 1, QMAX).astype(np.int8)
+    return q, scales
+
+
+def quantize_hifigan(tensors: dict) -> Tuple[bytes, bytes]:
+    """Quantize all HiFi-GAN decoder weight tensors to int8.
+    Returns (qdata_bytes, scales_bytes) in the same order as hifigan_quantize() in C."""
+    dec = "decoder."
+    q_parts = []
+    s_parts = []
+
+    def add_q(w_np: np.ndarray):
+        """w_np is [out_ch, in_ch, k]"""
+        q, s = quantize_conv_w(w_np)
+        q_parts.append(q.tobytes())
+        s_parts.append(s.tobytes())
+
+    # conv_pre: [512, 192, 7]
+    add_q(tensors[dec + "conv_pre.weight"])
+
+    # upsamplers: stored as [in,out,k] in safetensors → transpose to [out,in,k]
+    for i in range(NUM_UP):
+        w = tensors[f"{dec}upsampler.{i}.weight"]
+        add_q(np.transpose(w, (1, 0, 2)))
+
+    # resblocks: 4 stages × 3 MRF × (3 dil × c1 + 3 dil × c2)
+    for s in range(4):
+        for kb in range(3):
+            rb = s * 3 + kb
+            base = f"{dec}resblocks.{rb}."
+            for d in range(RF_DILS):
+                add_q(tensors[f"{base}convs1.{d}.weight"])
+            for d in range(RF_DILS):
+                add_q(tensors[f"{base}convs2.{d}.weight"])
+
+    # conv_post: [1, 32, 7]
+    add_q(tensors[dec + "conv_post.weight"])
+
+    return b"".join(q_parts), b"".join(s_parts)
 
 
 # ============================================================
@@ -345,7 +417,7 @@ def group_sections(tensors: List[TensorRec]) -> List[SectionRec]:
 # ============================================================
 # Export: write binary + header
 # ============================================================
-def export(tensors: dict, out_bin: str, out_header: str = None):
+def export(tensors: dict, out_bin: str, out_header: str = None, int8: bool = False):
     plan = build_export_plan(tensors)
     sections = group_sections(plan)
 
@@ -356,14 +428,34 @@ def export(tensors: dict, out_bin: str, out_header: str = None):
     print(f"  total floats: {total_floats:,}")
     print(f"  total bytes:  {total_bytes:,} ({total_bytes / 1024 / 1024:.1f} MB)")
 
+    # ── Compute int8 quantized HiFi-GAN weights ──
+    qdata_bytes = b""
+    scales_bytes = b""
+    qdata_size = 0
+    n_scales = 0
+
+    if int8:
+        print(f"  quantizing HiFi-GAN to int8...")
+        qdata_bytes, scales_bytes = quantize_hifigan(tensors)
+        qdata_size = len(qdata_bytes)
+        n_scales = len(scales_bytes) // 4
+        print(f"  int8 qdata:  {qdata_size:,} bytes ({qdata_size / 1024 / 1024:.1f} MB)")
+        print(f"  scales:      {n_scales} (float32)")
+
+    ver = 2 if int8 else VERSION
+
     # ── Write binary ──
     with open(out_bin, "wb") as f:
         f.write(MAGIC)
-        f.write(struct.pack("<I", VERSION))
+        f.write(struct.pack("<I", ver))
         f.write(struct.pack("<I", VOCAB_SIZE))
         f.write(struct.pack("<I", HIDDEN))
         f.write(struct.pack("<Q", total_bytes))
-        f.write(struct.pack("<Q", 0))  # reserved
+        if int8:
+            f.write(struct.pack("<Q", qdata_size))
+            f.write(struct.pack("<Q", n_scales))
+        else:
+            f.write(struct.pack("<Q", 0))  # reserved
 
         for t in plan:
             if t.transform == "none":
@@ -379,28 +471,39 @@ def export(tensors: dict, out_bin: str, out_header: str = None):
                 print(f"  [WARN] {t.name}: expected {t.n} floats, got {data.size}")
             f.write(data.astype(np.float32).tobytes())
 
+        # ── Append int8 quantized HiFi-GAN weights ──
+        if int8:
+            f.write(qdata_bytes)
+            f.write(scales_bytes)
+
     size_mb = os.path.getsize(out_bin) / 1024 / 1024
     print(f"  written:     {out_bin} ({size_mb:.1f} MB)")
 
     # ── Write header ──
     if out_header:
-        gen_header(plan, sections, out_header)
+        gen_header(plan, sections, out_header, int8=int8,
+                   qdata_size=qdata_size, n_scales=n_scales)
         print(f"  header:      {out_header}")
 
 
 # ============================================================
 # Generate C header
 # ============================================================
-def gen_header(plan: List[TensorRec], sections: List[SectionRec], path: str):
+def gen_header(plan: List[TensorRec], sections: List[SectionRec], path: str,
+               int8: bool = False, qdata_size: int = 0, n_scales: int = 0):
     lines: List[str] = []
     L = lines.append
+
+    ver = 2 if int8 else VERSION
+    hdr_size = 48 if int8 else HEADER_SIZE
 
     L(f"/* ============================================================")
     L(f" * {os.path.basename(path)} — Auto-generated by export_weights.py")
     L(f" * Model: facebook/mms-tts-por (VITS, 36.3M params)")
     L(f" * DO NOT EDIT MANUALLY — regenerate with:")
     L(f" *   python export_weights.py --input model.safetensors \\")
-    L(f" *       --output model.vtsm --header {os.path.basename(path)}")
+    L(f" *       --output model.vtsm --header {os.path.basename(path)}"
+        + (" --int8" if int8 else ""))
     L(f" * ============================================================ */")
     L(f"")
     L(f"#ifndef MODEL_WEIGHTS_H")
@@ -413,11 +516,16 @@ def gen_header(plan: List[TensorRec], sections: List[SectionRec], path: str):
     # ── File header constants ──
     L(f"/* ── File header ── */")
     L(f"#define WTS_MAGIC            0x4D535456u  /* 'V','T','S','M' LE */")
-    L(f"#define WTS_VERSION          {VERSION}")
+    L(f"#define WTS_VERSION          {ver}")
     L(f"#define WTS_VOCAB_SIZE       {VOCAB_SIZE}")
     L(f"#define WTS_HIDDEN_SIZE      {HIDDEN}")
-    L(f"#define WTS_FILE_HEADER_SIZE {HEADER_SIZE}")
+    L(f"#define WTS_FILE_HEADER_SIZE {hdr_size}")
     L(f"#define WTS_TOTAL_DATA_BYTES {total_bytes(plan)}")
+    if int8:
+        L(f"#define WTS_QDATA_SIZE         {qdata_size}  /* int8 weight elements */")
+        L(f"#define WTS_N_SCALES           {n_scales}  /* per-channel scales (float32) */")
+        L(f"/* int8 qdata offset: WTS_FILE_HEADER_SIZE + WTS_TOTAL_DATA_BYTES */")
+        L(f"/* scales offset:     WTS_FILE_HEADER_SIZE + WTS_TOTAL_DATA_BYTES + WTS_QDATA_SIZE */")
     L(f"")
 
     # ── Model dimension constants ──
@@ -623,6 +731,8 @@ def main():
                         help="Output .vtsm binary path")
     parser.add_argument("--header", type=str, default=None,
                         help="Output .h header path (default: <output>.h)")
+    parser.add_argument("--int8", action="store_true",
+                        help="Also write int8 quantized HiFi-GAN weights (v2 format)")
     args = parser.parse_args()
 
     if args.header is None:
@@ -634,7 +744,7 @@ def main():
     print(f"  {len(tensors)} tensors in safetensors")
     print()
 
-    export(tensors, args.output, args.header)
+    export(tensors, args.output, args.header, int8=args.int8)
     print("Done.")
 
 

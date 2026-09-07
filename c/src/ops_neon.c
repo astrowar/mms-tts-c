@@ -245,13 +245,14 @@ void conv1d(const float *VITS_RESTRICT in,
         float *VITS_RESTRICT out_o = out + (size_t)o * T;
         const float *VITS_RESTRICT w_o =
             c->weight + (size_t)o * in_ch * k;
+        const float bias_o = c->bias ? c->bias[o] : 0.0f;
 
         /* If the kernel footprint is wider than T, there is no
          * bounds-check-free interior region. Process the full row
          * with the scalar border kernel to avoid overlap/OOB writes. */
         if (interior_begin >= interior_end) {
             for (int t = 0; t < T; ++t) {
-                float acc = c->bias[o];
+                float acc = bias_o;
                 for (int i = 0; i < in_ch; ++i) {
                     const float *VITS_RESTRICT in_i = in + (size_t)i * T;
                     const float *VITS_RESTRICT w_i = w_o + (size_t)i * k;
@@ -268,7 +269,7 @@ void conv1d(const float *VITS_RESTRICT in,
 
         /* Left border. */
         for (int t = 0; t < interior_begin; ++t) {
-            float acc = c->bias[o];
+            float acc = bias_o;
             for (int i = 0; i < in_ch; ++i) {
                 const float *VITS_RESTRICT in_i = in + (size_t)i * T;
                 const float *VITS_RESTRICT w_i = w_o + (size_t)i * k;
@@ -286,7 +287,7 @@ void conv1d(const float *VITS_RESTRICT in,
 #if VITS_HAS_NEON
         /* Main NEON path: four time positions per vector. */
         for (; t + 3 < interior_end; t += 4) {
-            float32x4_t acc = vdupq_n_f32(c->bias[o]);
+            float32x4_t acc = vdupq_n_f32(bias_o);
 
             for (int i = 0; i < in_ch; ++i) {
                 const float *VITS_RESTRICT in_i = in + (size_t)i * T;
@@ -306,7 +307,7 @@ void conv1d(const float *VITS_RESTRICT in,
 #endif
 
         for (; t < interior_end; ++t) {
-            float acc = c->bias[o];
+            float acc = bias_o;
             for (int i = 0; i < in_ch; ++i) {
                 const float *VITS_RESTRICT in_i = in + (size_t)i * T;
                 const float *VITS_RESTRICT w_i = w_o + (size_t)i * k;
@@ -318,7 +319,7 @@ void conv1d(const float *VITS_RESTRICT in,
 
         /* Right border. */
         for (t = interior_end; t < T; ++t) {
-            float acc = c->bias[o];
+            float acc = bias_o;
             for (int i = 0; i < in_ch; ++i) {
                 const float *VITS_RESTRICT in_i = in + (size_t)i * T;
                 const float *VITS_RESTRICT w_i = w_o + (size_t)i * k;
@@ -459,12 +460,13 @@ void conv_transpose1d(const float *VITS_RESTRICT in,
 #endif
     for (int o = 0; o < out_ch; ++o) {
         float *VITS_RESTRICT out_o = out + (size_t)o * oT;
+        const float bias_o = c->bias ? c->bias[o] : 0.0f;
 
 #if VITS_HAS_NEON
-        fill_f32_neon(out_o, oT, c->bias[o]);
+        fill_f32_neon(out_o, oT, bias_o);
 #else
         for (int p = 0; p < oT; ++p)
-            out_o[p] = c->bias[o];
+            out_o[p] = bias_o;
 #endif
 
         const float *VITS_RESTRICT w_o =

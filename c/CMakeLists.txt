@@ -35,11 +35,13 @@ if(CMAKE_SYSTEM_PROCESSOR MATCHES "x86_64|AMD64|i686|i386")
     endif()
 elseif(CMAKE_SYSTEM_PROCESSOR MATCHES "aarch64|arm64|armv8")
     set(OPS_SRC "${CMAKE_CURRENT_SOURCE_DIR}/src/ops_neon.c")
+    set(INT8_OPS_SRC "${CMAKE_CURRENT_SOURCE_DIR}/src/ops_int8_neon.c")
     message(STATUS "Architecture: ARM64 + NEON")
 elseif(CMAKE_SYSTEM_PROCESSOR MATCHES "armv7|arm")
     check_c_compiler_flag("-mfpu=neon" HAS_NEON)
     if(HAS_NEON)
         set(OPS_SRC "${CMAKE_CURRENT_SOURCE_DIR}/src/ops_neon.c")
+        set(INT8_OPS_SRC "${CMAKE_CURRENT_SOURCE_DIR}/src/ops_int8_neon.c")
         set(ARCH_FLAGS "-mfpu=neon")
         message(STATUS "Architecture: ARMv7 + NEON")
     else()
@@ -87,9 +89,12 @@ endif()
 
 target_link_libraries(mms-tts PRIVATE m)
 
-# Architecture-specific flags apply only to the ops file
+# Architecture-specific flags apply to SIMD ops files
 if(ARCH_FLAGS)
     set_source_files_properties(${OPS_SRC} PROPERTIES COMPILE_OPTIONS "${ARCH_FLAGS}")
+    if(INT8_OPS_SRC MATCHES "neon")
+        set_source_files_properties(${INT8_OPS_SRC} PROPERTIES COMPILE_OPTIONS "${ARCH_FLAGS}")
+    endif()
 endif()
 
 # model_weights.h dependency
