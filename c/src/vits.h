@@ -163,27 +163,28 @@ typedef struct {
 } HiFiGan;
 
 /* ============================================================
- * Quantized HiFi-GAN (int16 per-output-channel)
+ * Quantized HiFi-GAN (int8 per-output-channel)
  *
- * Weights stored as int16 with per-output-channel float32 scale.
+ * Weights stored as int8 with per-output-channel float32 scale.
  * Activations remain float32. Dequantization happens at the
  * output of each conv:  out = acc * scale[o] + bias[o]
  *
- * int16 gives 32768 levels — ~267× better than int8.
- * For fan-in=2816 (largest ResBlock conv), output error is
- * ~0.08% of signal (vs ~26% for int8).
+ * int8 gives 256 levels. High fan-in layers (upsampler 8192,
+ * ResBlock 2816) amplify per-weight rounding error, so int8
+ * trades accuracy for speed/memory vs int16 (32768 levels).
+ * See quantization.md for measured error.
  * ============================================================ */
 
 typedef struct {
     int in_ch, out_ch, k, pad, dilation;
-    const int16_t *weight;    /* [out_ch][in_ch][k] */
+    const int8_t *weight;     /* [out_ch][in_ch][k] */
     const float   *scale;     /* [out_ch] */
     float         *bias;      /* [out_ch] */
 } Conv1dQ;
 
 typedef struct {
     int in_ch, out_ch, k, stride, pad;
-    const int16_t *weight;    /* [out_ch][in_ch][k] */
+    const int8_t *weight;     /* [out_ch][in_ch][k] */
     const float   *scale;     /* [out_ch] */
     float         *bias;      /* [out_ch] */
 } ConvTranspose1dQ;
@@ -202,9 +203,9 @@ typedef struct {
     Conv1dQ conv_post;        /* 32 -> 1, k=7, no bias */
 
     /* Quantized weight storage (allocated by hifigan_quantize) */
-    int16_t *qdata;           /* all int16 weights concatenated */
+    int8_t  *qdata;           /* all int8 weights concatenated */
     float   *scales;          /* all per-channel scales concatenated */
-    size_t qdata_size;        /* total int16 elements */
+    size_t qdata_size;        /* total int8 elements */
     int     n_scales;         /* total scale entries */
 } HiFiGanQ;
 

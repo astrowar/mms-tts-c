@@ -26,9 +26,9 @@ static inline int imax_i(int a, int b) { return a > b ? a : b; }
 
 
 /* ============================================================
- * Quantized Conv1D (int16 weights, float32 activations)
+ * Quantized Conv1D (int8 weights, float32 activations)
  *
- * Weights:  int16 [out_ch][in_ch][k]  — quantized with per-channel scale
+ * Weights:  int8 [out_ch][in_ch][k]  — quantized with per-channel scale
  * Scales:   float32 [out_ch]
  * Bias:     float32 [out_ch]
  *
@@ -68,17 +68,17 @@ void conv1d_q(
         const float scale_o = c->scale[o];
         const float bias_o  = c->bias ? c->bias[o] : 0.0f;
 
-        const int16_t *VITS_RESTRICT w_o =
+        const int8_t *VITS_RESTRICT w_o =
             c->weight + (size_t)o * in_ch * k;
 
         /* Zero accumulator */
         memset(out_o, 0, sizeof(float) * (size_t)T);
 
-        /* Accumulate raw int16 * float32 products */
+        /* Accumulate raw int8 * float32 products */
         for (int i = 0; i < in_ch; i++) {
 
             const float *VITS_RESTRICT in_i = in + (size_t)i * T;
-            const int16_t *VITS_RESTRICT w_i = w_o + (size_t)i * k;
+            const int8_t *VITS_RESTRICT w_i = w_o + (size_t)i * k;
 
             for (int j = 0; j < k; j++) {
 
@@ -125,7 +125,7 @@ void conv1d_q(
 
 
 /* ============================================================
- * Quantized ConvTranspose1D (int16 weights, float32 activations)
+ * Quantized ConvTranspose1D (int8 weights, float32 activations)
  *
  * Same dequantization scheme as conv1d_q.
  * Weight layout: [out_ch][in_ch][k]
@@ -167,7 +167,7 @@ void conv_transpose1d_q(
         const float scale_o = c->scale[o];
         const float bias_o  = c->bias ? c->bias[o] : 0.0f;
 
-        const int16_t *VITS_RESTRICT w_o =
+        const int8_t *VITS_RESTRICT w_o =
             c->weight + (size_t)o * in_ch * k;
 
         /* Zero accumulator */
@@ -176,7 +176,7 @@ void conv_transpose1d_q(
         for (int i = 0; i < in_ch; i++) {
 
             const float *VITS_RESTRICT in_i = in + (size_t)i * T;
-            const int16_t *VITS_RESTRICT w_i = w_o + (size_t)i * k;
+            const int8_t *VITS_RESTRICT w_i = w_o + (size_t)i * k;
 
             for (int j = 0; j < k; j++) {
 

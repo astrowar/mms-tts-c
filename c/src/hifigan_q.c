@@ -12,13 +12,13 @@ void hifigan_q_set_dump_dir(const char *dir) { hifi_q_dump_dir = dir; }
 #endif
 
 /* ============================================================
- * Quantization: F32 → int16 per-output-channel (symmetric)
+ * Quantization: F32 → int8 per-output-channel (symmetric)
  *
  * For each conv weight tensor [out_ch, in_ch, k]:
- *   scale[o] = max(|W[o,:,:]|) / 32767.0
- *   Q[o,:,:] = clamp(round(W[o,:,:] / scale[o]), -32768, 32767)
+ *   scale[o] = max(|W[o,:,:]|) / 127.0
+ *   Q[o,:,:] = clamp(round(W[o,:,:] / scale[o]), -128, 127)
  *
- * All int16 data is stored in one contiguous buffer (qdata),
+ * All int8 data is stored in one contiguous buffer (qdata),
  * all scales in another (scales).
  *
  * ALL dimensions are read from the F32 model struct — nothing
@@ -26,13 +26,13 @@ void hifigan_q_set_dump_dir(const char *dir) { hifi_q_dump_dir = dir; }
  * the architecture changes (different channels, kernels, etc).
  * ============================================================ */
 
-#define QMAX 32767
+#define QMAX 127
 
-/* Helper: quantize a single F32 weight tensor, write int16 + scale */
+/* Helper: quantize a single F32 weight tensor, write int8 + scale */
 static void quantize_tensor(
     const float *w,
     int out_ch, int in_ch, int k,
-    int16_t *q_out,
+    int8_t *q_out,
     float *scale_out)
 {
     for (int o = 0; o < out_ch; o++) {
@@ -51,14 +51,14 @@ static void quantize_tensor(
 
         const float inv_scale = 1.0f / scale;
 
-        int16_t *q_o = q_out + (size_t)o * in_ch * k;
+        int8_t *q_o = q_out + (size_t)o * in_ch * k;
         for (int i = 0; i < in_ch * k; i++) {
             float v = w_o[i] * inv_scale;
-            /* Round to nearest, clamp to [-32768, 32767] */
+            /* Round to nearest, clamp to [-128, 127] */
             long q = (long)lroundf(v);
             if (q > QMAX)     q = QMAX;
             if (q < -QMAX - 1) q = -QMAX - 1;
-            q_o[i] = (int16_t)q;
+            q_o[i] = (int8_t)q;
         }
     }
 }
@@ -69,7 +69,7 @@ int hifigan_quantize(const HiFiGan *f32, HiFiGanQ *q)
     memset(q, 0, sizeof(*q));
 
     /*
-     * Quantize ALL HiFi-GAN layers to int16 per-output-channel.
+     * Quantize ALL HiFi-GAN layers to int8 per-output-channel.
      * All dimensions read from the F32 model — no hardcoded values.
      */
     size_t total_q = 0;
@@ -119,7 +119,7 @@ int hifigan_quantize(const HiFiGan *f32, HiFiGanQ *q)
     q->qdata_size = total_q;
     q->n_scales = total_scales;
 
-    q->qdata = (int16_t *)malloc(total_q * sizeof(int16_t));
+    q->qdata = (int8_t *)malloc(total_q * sizeof(int8_t));
     q->scales = (float *)malloc((size_t)total_scales * sizeof(float));
     if (!q->qdata || !q->scales) {
         free(q->qdata);
@@ -270,7 +270,7 @@ void hifigan_free_q(HiFiGanQ *q)
 /* ============================================================
  * Quantized HiFi-GAN forward pass
  *
- * All conv layers use int16 weights with per-channel dequantization.
+ * All conv layers use int8 weights with per-channel dequantization.
  * Activations remain float32 throughout.
  * Dumps prefixed "06q_" to distinguish from F32 dumps.
  * ============================================================ */

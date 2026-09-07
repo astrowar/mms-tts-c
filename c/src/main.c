@@ -104,19 +104,19 @@ int main(int argc, char **argv)
     model->sampling_rate = SAMPLE_RATE;
     printf("  sampling rate: %d Hz\n", model->sampling_rate);
 
-    /* Int16 HiFi-GAN quantization (from F32 mmap weights) */
+    /* Int8 HiFi-GAN quantization (from F32 mmap weights) */
     if (hifi_int8) {
-        printf("  quantizing HiFi-GAN to int16 (per-channel) ...\n");
+        printf("  quantizing HiFi-GAN to int8 (per-channel) ...\n");
         rc = hifigan_quantize(&model->decoder, &model->decoder_q);
         if (rc != 0) {
-            fprintf(stderr, "  Error: int16 quantization failed\n");
+            fprintf(stderr, "  Error: int8 quantization failed\n");
             free_model(model);
             free(model);
             return 1;
         }
         model->use_int8_hifi = 1;
-        printf("  int16 size: %.1f MB (scales: %d entries)\n",
-               (model->decoder_q.qdata_size * 2) / (1024.0 * 1024.0),
+        printf("  int8 size: %.1f MB (scales: %d entries)\n",
+               (model->decoder_q.qdata_size) / (1024.0 * 1024.0),
                model->decoder_q.n_scales);
     }
 
