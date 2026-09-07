@@ -151,18 +151,8 @@ void hifigan_forward(const HiFiGan *dec,
     size_t final_size = (size_t)cur_ch * cur_T;
     leaky_relu_f(A, final_size, 0.01f);
 
-    /*
-     * conv_post: Conv1d(32, 1, k=7, pad=3, no bias)
-     */
-    {
-        static const float zero_bias = 0.0f;
-        Conv1d cp = {
-            .in_ch = cur_ch, .out_ch = 1, .k = 7,
-            .pad = 3, .dilation = 1,
-            .weight = (float *)dec->conv_post_w, .bias = (float *)&zero_bias
-        };
-        conv1d(A, cur_ch, cur_T, &cp, wave);
-    }
+    /* conv_post (metadata from struct, no bias) */
+    conv1d(A, dec->conv_post.in_ch, cur_T, &dec->conv_post, wave);
 
     *wave_T = wave_len;
 

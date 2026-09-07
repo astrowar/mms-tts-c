@@ -159,7 +159,7 @@ typedef struct {
     Conv1d conv_pre;          /* 192 -> 512, k=7 */
     ConvTranspose1d up[4];
     ResBlock rb[12];          /* 4 stages x 3 MRF */
-    float *conv_post_w;       /* 32 -> 1, k=7, no bias */
+    Conv1d conv_post;         /* 32 -> 1, k=7, no bias */
 } HiFiGan;
 
 /* ============================================================

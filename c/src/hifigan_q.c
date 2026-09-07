@@ -20,6 +20,10 @@ void hifigan_q_set_dump_dir(const char *dir) { hifi_q_dump_dir = dir; }
  *
  * All int16 data is stored in one contiguous buffer (qdata),
  * all scales in another (scales).
+ *
+ * ALL dimensions are read from the F32 model struct — nothing
+ * is hardcoded. This ensures the quantizer stays correct if
+ * the architecture changes (different channels, kernels, etc).
  * ============================================================ */
 
 #define QMAX 32767
@@ -66,44 +70,51 @@ int hifigan_quantize(const HiFiGan *f32, HiFiGanQ *q)
 
     /*
      * Quantize ALL HiFi-GAN layers to int16 per-output-channel.
-     * int16 (32767 levels) has enough precision even for large
-     * fan-in layers (upsamplers with 8192 inputs).
-     *
-     * Layout:
-     *   conv_pre:    [512, 192, 7]
-     *   up[0..3]:    [out, in, k] each
-     *   rb[0..11]:   each has c1[3] + c2[3]
-     *   conv_post:   [1, 32, 7]
+     * All dimensions read from the F32 model — no hardcoded values.
      */
     size_t total_q = 0;
     int total_scales = 0;
 
     /* conv_pre */
-    total_q += (size_t)512 * 192 * 7;
-    total_scales += 512;
+    {
+        int oc = f32->conv_pre.out_ch;
+        int ic = f32->conv_pre.in_ch;
+        int k  = f32->conv_pre.k;
+        total_q += (size_t)oc * ic * k;
+        total_scales += oc;
+    }
 
     /* upsamplers */
-    static const int up_in[]  = {512, 256, 128, 64};
-    static const int up_out[] = {256, 128, 64, 32};
-    static const int up_k[]   = {16, 16, 4, 4};
     for (int i = 0; i < NUM_UP; i++) {
-        total_q += (size_t)up_out[i] * up_in[i] * up_k[i];
-        total_scales += up_out[i];
+        int oc = f32->up[i].out_ch;
+        int ic = f32->up[i].in_ch;
+        int k  = f32->up[i].k;
+        total_q += (size_t)oc * ic * k;
+        total_scales += oc;
     }
 
     /* resblocks */
-    static const int rb_ch[] = {256, 256, 256, 128, 128, 128, 64, 64, 64, 32, 32, 32};
-    static const int rb_k[]  = {3, 7, 11, 3, 7, 11, 3, 7, 11, 3, 7, 11};
-    for (int r = 0; r < 12; r++) {
+    for (int r = 0; r < NUM_UP * RF_DILS; r++) {
         for (int d = 0; d < RF_DILS; d++) {
-            total_q += 2 * (size_t)rb_ch[r] * rb_ch[r] * rb_k[r];
-            total_scales += 2 * rb_ch[r];
+            int oc1 = f32->rb[r].c1[d].out_ch;
+            int ic1 = f32->rb[r].c1[d].in_ch;
+            int k1  = f32->rb[r].c1[d].k;
+            int oc2 = f32->rb[r].c2[d].out_ch;
+            int ic2 = f32->rb[r].c2[d].in_ch;
+            int k2  = f32->rb[r].c2[d].k;
+            total_q += (size_t)oc1 * ic1 * k1 + (size_t)oc2 * ic2 * k2;
+            total_scales += oc1 + oc2;
         }
     }
 
     /* conv_post */
-    total_q += (size_t)1 * 32 * 7;
-    total_scales += 1;
+    {
+        int oc = f32->conv_post.out_ch;
+        int ic = f32->conv_post.in_ch;
+        int k  = f32->conv_post.k;
+        total_q += (size_t)oc * ic * k;
+        total_scales += oc;
+    }
 
     q->qdata_size = total_q;
     q->n_scales = total_scales;
@@ -120,104 +131,117 @@ int hifigan_quantize(const HiFiGan *f32, HiFiGanQ *q)
 
     /*
      * Quantize tensors in order, tracking offsets.
+     * All metadata (ch, k, pad, dilation) copied from F32 struct.
      */
     size_t qoff = 0;
     int soff = 0;
 
-    /* conv_pre: [512, 192, 7] */
-    quantize_tensor(f32->conv_pre.weight, 512, 192, 7,
-                    q->qdata + qoff, q->scales + soff);
-    q->conv_pre.in_ch = 192;
-    q->conv_pre.out_ch = 512;
-    q->conv_pre.k = 7;
-    q->conv_pre.pad = 3;
-    q->conv_pre.dilation = 1;
-    q->conv_pre.weight = q->qdata + qoff;
-    q->conv_pre.scale = q->scales + soff;
-    q->conv_pre.bias = f32->conv_pre.bias;
-    qoff += (size_t)512 * 192 * 7;
-    soff += 512;
-
-    /* upsamplers: quantized to int16 */
-    for (int i = 0; i < NUM_UP; i++) {
-        int in_ch = up_in[i], out_ch = up_out[i], k = up_k[i];
-        quantize_tensor(f32->up[i].weight, out_ch, in_ch, k,
+    /* conv_pre */
+    {
+        int oc = f32->conv_pre.out_ch;
+        int ic = f32->conv_pre.in_ch;
+        int k  = f32->conv_pre.k;
+        quantize_tensor(f32->conv_pre.weight, oc, ic, k,
                         q->qdata + qoff, q->scales + soff);
-        q->up[i].in_ch  = in_ch;
-        q->up[i].out_ch = out_ch;
+        q->conv_pre.in_ch = ic;
+        q->conv_pre.out_ch = oc;
+        q->conv_pre.k = k;
+        q->conv_pre.pad = f32->conv_pre.pad;
+        q->conv_pre.dilation = f32->conv_pre.dilation;
+        q->conv_pre.weight = q->qdata + qoff;
+        q->conv_pre.scale = q->scales + soff;
+        q->conv_pre.bias = f32->conv_pre.bias;
+        qoff += (size_t)oc * ic * k;
+        soff += oc;
+    }
+
+    /* upsamplers */
+    for (int i = 0; i < NUM_UP; i++) {
+        int oc = f32->up[i].out_ch;
+        int ic = f32->up[i].in_ch;
+        int k  = f32->up[i].k;
+        quantize_tensor(f32->up[i].weight, oc, ic, k,
+                        q->qdata + qoff, q->scales + soff);
+        q->up[i].in_ch  = ic;
+        q->up[i].out_ch = oc;
         q->up[i].k      = k;
         q->up[i].stride = f32->up[i].stride;
         q->up[i].pad    = f32->up[i].pad;
         q->up[i].weight = q->qdata + qoff;
         q->up[i].scale  = q->scales + soff;
         q->up[i].bias   = f32->up[i].bias;
-        qoff += (size_t)out_ch * in_ch * k;
-        soff += out_ch;
+        qoff += (size_t)oc * ic * k;
+        soff += oc;
     }
 
     /* resblocks */
-    for (int r = 0; r < 12; r++) {
+    for (int r = 0; r < NUM_UP * RF_DILS; r++) {
         ResBlockQ *rbq = &q->rb[r];
         const ResBlock *rb = &f32->rb[r];
-        int ch = rb_ch[r], k = rb_k[r];
 
-        rbq->ch = ch;
-        rbq->kernel = k;
+        rbq->ch = rb->ch;
+        rbq->kernel = rb->kernel;
         for (int d = 0; d < RF_DILS; d++)
             rbq->dil[d] = rb->dil[d];
 
         for (int d = 0; d < RF_DILS; d++) {
-            /* c1[d]: Conv1d(ch, ch, k, dil from model: 1,3,5) */
-            quantize_tensor(rb->c1[d].weight, ch, ch, k,
-                            q->qdata + qoff, q->scales + soff);
-            rbq->c1[d].in_ch = ch;
-            rbq->c1[d].out_ch = ch;
-            rbq->c1[d].k = k;
-            rbq->c1[d].pad = rb->c1[d].pad;
-            rbq->c1[d].dilation = rb->c1[d].dilation;
-            rbq->c1[d].weight = q->qdata + qoff;
-            rbq->c1[d].scale = q->scales + soff;
-            rbq->c1[d].bias = rb->c1[d].bias;
-            qoff += (size_t)ch * ch * k;
-            soff += ch;
+            /* c1[d] */
+            {
+                int oc = rb->c1[d].out_ch;
+                int ic = rb->c1[d].in_ch;
+                int k  = rb->c1[d].k;
+                quantize_tensor(rb->c1[d].weight, oc, ic, k,
+                                q->qdata + qoff, q->scales + soff);
+                rbq->c1[d].in_ch = ic;
+                rbq->c1[d].out_ch = oc;
+                rbq->c1[d].k = k;
+                rbq->c1[d].pad = rb->c1[d].pad;
+                rbq->c1[d].dilation = rb->c1[d].dilation;
+                rbq->c1[d].weight = q->qdata + qoff;
+                rbq->c1[d].scale = q->scales + soff;
+                rbq->c1[d].bias = rb->c1[d].bias;
+                qoff += (size_t)oc * ic * k;
+                soff += oc;
+            }
 
-            /* c2[d]: Conv1d(ch, ch, k, dil=1) */
-            quantize_tensor(rb->c2[d].weight, ch, ch, k,
-                            q->qdata + qoff, q->scales + soff);
-            rbq->c2[d].in_ch = ch;
-            rbq->c2[d].out_ch = ch;
-            rbq->c2[d].k = k;
-            rbq->c2[d].pad = rb->c2[d].pad;
-            rbq->c2[d].dilation = 1;
-            rbq->c2[d].weight = q->qdata + qoff;
-            rbq->c2[d].scale = q->scales + soff;
-            rbq->c2[d].bias = rb->c2[d].bias;
-            qoff += (size_t)ch * ch * k;
-            soff += ch;
+            /* c2[d] */
+            {
+                int oc = rb->c2[d].out_ch;
+                int ic = rb->c2[d].in_ch;
+                int k  = rb->c2[d].k;
+                quantize_tensor(rb->c2[d].weight, oc, ic, k,
+                                q->qdata + qoff, q->scales + soff);
+                rbq->c2[d].in_ch = ic;
+                rbq->c2[d].out_ch = oc;
+                rbq->c2[d].k = k;
+                rbq->c2[d].pad = rb->c2[d].pad;
+                rbq->c2[d].dilation = rb->c2[d].dilation;
+                rbq->c2[d].weight = q->qdata + qoff;
+                rbq->c2[d].scale = q->scales + soff;
+                rbq->c2[d].bias = rb->c2[d].bias;
+                qoff += (size_t)oc * ic * k;
+                soff += oc;
+            }
         }
     }
 
-    /* conv_post: [1, 32, 7], no bias */
+    /* conv_post */
     {
-        /* Build a temporary Conv1d view of the F32 conv_post */
-        Conv1d cp = {
-            .in_ch = 32, .out_ch = 1, .k = 7,
-            .pad = 3, .dilation = 1,
-            .weight = f32->conv_post_w, .bias = NULL
-        };
-        (void)cp;
-        quantize_tensor(f32->conv_post_w, 1, 32, 7,
+        int oc = f32->conv_post.out_ch;
+        int ic = f32->conv_post.in_ch;
+        int k  = f32->conv_post.k;
+        quantize_tensor(f32->conv_post.weight, oc, ic, k,
                         q->qdata + qoff, q->scales + soff);
-        q->conv_post.in_ch = 32;
-        q->conv_post.out_ch = 1;
-        q->conv_post.k = 7;
-        q->conv_post.pad = 3;
-        q->conv_post.dilation = 1;
+        q->conv_post.in_ch = ic;
+        q->conv_post.out_ch = oc;
+        q->conv_post.k = k;
+        q->conv_post.pad = f32->conv_post.pad;
+        q->conv_post.dilation = f32->conv_post.dilation;
         q->conv_post.weight = q->qdata + qoff;
         q->conv_post.scale = q->scales + soff;
-        q->conv_post.bias = NULL;  /* no bias for conv_post */
-        qoff += (size_t)1 * 32 * 7;
-        soff += 1;
+        q->conv_post.bias = f32->conv_post.bias;
+        qoff += (size_t)oc * ic * k;
+        soff += oc;
     }
 
     /* Sanity check */
@@ -244,22 +268,23 @@ void hifigan_free_q(HiFiGanQ *q)
 
 
 /* ============================================================
- * Quantized HiFi-GAN forward pass (hybrid)
+ * Quantized HiFi-GAN forward pass
  *
- * Strategy: quantize conv_pre + ResBlocks + conv_post to int8.
- * Keep upsamplers in F32 — their large fan-in (512×16=8192)
- * amplifies per-weight quantization error too much.
- *
- * The `f32` parameter provides F32 upsampler weights from the mmap.
+ * All conv layers use int16 weights with per-channel dequantization.
+ * Activations remain float32 throughout.
  * Dumps prefixed "06q_" to distinguish from F32 dumps.
  * ============================================================ */
 void hifigan_forward_q(const HiFiGanQ *dec, const HiFiGan *f32,
                        const float *mel, int mel_T,
                        float *wave, int *wave_T)
 {
+    (void)f32;  /* no longer needed — all convs are quantized */
+
     int wave_len = mel_T * TOTAL_UP;
 
-    size_t max_size = (size_t)32 * wave_len + 8192;
+    /* Buffer size: largest intermediate is at the last upstage output */
+    int last_ch = dec->up[NUM_UP - 1].out_ch;
+    size_t max_size = (size_t)last_ch * wave_len + 8192;
 
     float *A = (float *)malloc(max_size * sizeof(float));
     float *B = (float *)malloc(max_size * sizeof(float));
@@ -273,17 +298,17 @@ void hifigan_forward_q(const HiFiGanQ *dec, const HiFiGan *f32,
     int dump_this_call = (hifi_q_call_count == 1);
 #endif
 
-    /* ---- 1. conv_pre (int8) ---- */
-    conv1d_q(mel, 192, mel_T, &dec->conv_pre, A);
+    /* ---- 1. conv_pre ---- */
+    conv1d_q(mel, dec->conv_pre.in_ch, mel_T, &dec->conv_pre, A);
 
 #ifdef ENABLE_DUMP
     if (dump_this_call && hifi_q_dump_dir) {
-        int dim2[2] = {HIFI_INIT_CH, mel_T};
+        int dim2[2] = {dec->conv_pre.out_ch, mel_T};
         dump_f32(hifi_q_dump_dir, "06q_hifi_conv_pre", A, 2, dim2);
     }
 #endif
 
-    int cur_ch = HIFI_INIT_CH;
+    int cur_ch = dec->conv_pre.out_ch;
     int cur_T = mel_T;
 
     /* ---- 2. Four upsampling + MRF stages ---- */
@@ -292,17 +317,17 @@ void hifigan_forward_q(const HiFiGanQ *dec, const HiFiGan *f32,
 
         leaky_relu_f(A, cur_size, LEAKY_SLOPE);
 
-        /* Upsampler: int16 quantized */
+        /* Upsampler */
         int new_T;
         conv_transpose1d_q(A, cur_ch, cur_T, &dec->up[i], B, &new_T);
         int new_ch = dec->up[i].out_ch;
         size_t new_size = (size_t)new_ch * new_T;
 
-        /* MRF: 3 ResBlocks in parallel on B (int8) */
+        /* MRF: 3 ResBlocks in parallel on B */
         memset(A, 0, new_size * sizeof(float));
 
-        for (int j = 0; j < 3; j++) {
-            const ResBlockQ *rb = &dec->rb[i * 3 + j];
+        for (int j = 0; j < RF_DILS; j++) {
+            const ResBlockQ *rb = &dec->rb[i * RF_DILS + j];
 
             memcpy(C, B, new_size * sizeof(float));
 
@@ -323,7 +348,7 @@ void hifigan_forward_q(const HiFiGanQ *dec, const HiFiGan *f32,
             axpy_f(A, C, (int)new_size);
         }
 
-        scal_f(A, (int)new_size, 1.0f / 3.0f);
+        scal_f(A, (int)new_size, 1.0f / (float)RF_DILS);
 
 #ifdef ENABLE_DUMP
         if (dump_this_call && hifi_q_dump_dir) {
@@ -338,7 +363,7 @@ void hifigan_forward_q(const HiFiGanQ *dec, const HiFiGan *f32,
         cur_T = new_T;
     }
 
-    /* ---- 3. Output: LeakyReLU(0.01) -> conv_post (int8) -> tanh ---- */
+    /* ---- 3. Output: LeakyReLU(0.01) -> conv_post -> tanh ---- */
     size_t final_size = (size_t)cur_ch * cur_T;
     leaky_relu_f(A, final_size, 0.01f);
 

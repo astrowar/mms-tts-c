@@ -354,7 +354,16 @@ int load_vtsm(const char *path, VitsModel *model, Vocab *vocab)
 
         /* conv_post: Conv1d(32, 1, k=7, no bias) */
         int cp_idx = base + 2 + NUM_UP * 2 + 12 * 12;  /* last tensor */
-        model->decoder.conv_post_w = ptr_at(buf, wts_tensors[cp_idx].offset);
+        {
+            const int cp_k = 7;
+            model->decoder.conv_post.in_ch = rb_ch[3];
+            model->decoder.conv_post.out_ch = 1;
+            model->decoder.conv_post.k = cp_k;
+            model->decoder.conv_post.pad = (cp_k - 1) / 2;
+            model->decoder.conv_post.dilation = 1;
+            model->decoder.conv_post.weight = ptr_at(buf, wts_tensors[cp_idx].offset);
+            model->decoder.conv_post.bias = NULL;
+        }
     }
 
     return 0;

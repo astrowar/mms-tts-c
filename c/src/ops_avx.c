@@ -246,6 +246,9 @@ void conv1d(
     if (T <= 0 || in_ch <= 0 || out_ch <= 0)
         return;
 
+    static const float zero_f = 0.0f;
+    const float *bias = c->bias ? c->bias : &zero_f;
+
 #ifdef __AVX2__
 
     /*
@@ -278,8 +281,10 @@ void conv1d(
             max_shift = s;
     }
 
-    const int interior_begin = imax_i(0, -min_shift);
-    const int interior_end   = imin_i(T, T - max_shift);
+    int interior_begin = imax_i(0, -min_shift);
+    int interior_end   = imin_i(T, T - max_shift);
+    if (interior_begin > T) interior_begin = T;
+    if (interior_end < interior_begin) interior_end = interior_begin;
 
     const size_t work = (size_t)out_ch * in_ch * k * T;
 
@@ -299,7 +304,7 @@ void conv1d(
          */
         for (int t = 0; t < interior_begin; t++) {
 
-            float acc = c->bias[o];
+            float acc = bias[o];
 
             for (int i = 0; i < in_ch; i++) {
 
@@ -334,7 +339,7 @@ void conv1d(
          */
         for (; t + 7 < interior_end; t += 8) {
 
-            __m256 acc = _mm256_set1_ps(c->bias[o]);
+            __m256 acc = _mm256_set1_ps(bias[o]);
 
             for (int i = 0; i < in_ch; i++) {
 
@@ -366,7 +371,7 @@ void conv1d(
          */
         for (; t < interior_end; t++) {
 
-            float acc = c->bias[o];
+            float acc = bias[o];
 
             for (int i = 0; i < in_ch; i++) {
 
@@ -387,7 +392,7 @@ void conv1d(
          */
         for (t = interior_end; t < T; t++) {
 
-            float acc = c->bias[o];
+            float acc = bias[o];
 
             for (int i = 0; i < in_ch; i++) {
 
@@ -435,8 +440,10 @@ void conv1d_depthwise(
             max_shift = shift;
     }
 
-    const int interior_begin = imax_i(0, -min_shift);
-    const int interior_end   = imin_i(T, T - max_shift);
+    int interior_begin = imax_i(0, -min_shift);
+    int interior_end   = imin_i(T, T - max_shift);
+    if (interior_begin > T) interior_begin = T;
+    if (interior_end < interior_begin) interior_end = interior_begin;
 
     const size_t work = (size_t)ch * k * T;
 
@@ -551,6 +558,9 @@ void conv_transpose1d(
         return;
     }
 
+    static const float zero_f = 0.0f;
+    const float *bias = c->bias ? c->bias : &zero_f;
+
     const int oT = (T - 1) * stride - 2 * pad + k;
     *out_T = oT;
 
@@ -571,10 +581,10 @@ void conv_transpose1d(
          * Initialize with bias.
          */
 #ifdef __AVX2__
-        fill_f32_avx2(out_o, oT, c->bias[o]);
+        fill_f32_avx2(out_o, oT, bias[o]);
 #else
         for (int p = 0; p < oT; p++)
-            out_o[p] = c->bias[o];
+            out_o[p] = bias[o];
 #endif
 
         const float *VITS_RESTRICT w_o = c->weight + (size_t)o * in_ch * k;

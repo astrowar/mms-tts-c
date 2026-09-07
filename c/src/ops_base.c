@@ -101,7 +101,7 @@ void conv1d(
         float *VITS_RESTRICT out_o =
             out + (size_t)o * T;
 
-        const float bias = c->bias[o];
+        const float bias = c->bias ? c->bias[o] : 0.0f;
 
         /*
          * Initialize complete output row.
