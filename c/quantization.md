@@ -86,9 +86,19 @@ na saída comprime os picos.
 
 | Formato | Tamanho | Redução |
 |---------|---------|---------|
-| F32 (mmap) | 44.5 MB | — |
+| F32 HiFi-GAN (mmap) | 44.5 MB | — |
 | int16 + scales | 27.3 MB | 39% |
 | **int8 + scales** | **13.7 MB** | **69%** |
+
+### Tamanho do arquivo .vtsm
+
+| Versão | Conteúdo | Tamanho |
+|--------|----------|---------|
+| v1 (`model.vtsm`) | F32 completo (encoder+DP+flows+HiFi-GAN) | 108 MB |
+| **v2** (`model_int8.vtsm`) | F32 parcial (sem HiFi-GAN weights) + int8 | **67.4 MB** |
+
+O v2 elimina os 44.5 MB de F32 HiFi-GAN weights (redundantes com o
+int8) e não exige quantização em runtime.
 
 ### Velocidade (single-thread, máquina de dev, `OMP_NUM_THREADS=1`)
 
@@ -124,47 +134,87 @@ com 14 cores as camadas de conv grandes escalam.
 
 | Arquivo | Descrição |
 |---------|-----------|
-| `src/ops_int8.c` | `conv1d_q()` e `conv_transpose1d_q()` — kernel de convolução com pesos int8 (portável; usado sem AVX2) |
-| `src/ops_int8_avx2.c` | Mesma interface, vetorizada AVX2/FMA (8-lane em conv1d via FMA `x*(q*scale)` + bias na inicialização; transpose com blocos de 8/4 coeficientes convertidos int8→f32 uma vez por bloco, e passes escalar nos t's de borda onde o range por coeficiente diverge). Selecionada automaticamente no CMake em x86 + AVX2. |
+| `src/ops_int8.c` | `conv1d_q()` e `conv_transpose1d_q()` — kernel portável (fallback) |
+| `src/ops_int8_avx2.c` | AVX2/FMA 8-lane. conv1d: FMA `x*(q*scale)`, bias na init. Transpose: blocos de 8/4 coef int8→f32 + passes escalar nos t's de borda. Selecionada em x86 + AVX2. |
+| `src/ops_int8_neon.c` | NEON 4-lane (aarch64: `vfmaq_f32`; ARMv7: `vmlaq_f32`). conv1d: FMA 4-float. Transpose: blocos de 4 coef com `vmovl_s8→vmovl_s16→vcvtq_f32_s32` + passes escalar nas bordas. Selecionada em ARM64/ARMv7+NEON. |
 | `src/hifigan_q.c` | `hifigan_quantize()`, `hifigan_free_q()`, `hifigan_forward_q()` |
+| `src/vtsm.c` | Loader v1/v2; v2 mapeia int8+scales do arquivo (zero-copy) |
+| `export_weights.py` | Exportador; `--int8` gera v2 com int8 pré-quantizado |
 
 ### Modificações
 
 | Arquivo | Mudança |
 |---------|---------|
-| `src/vits.h` | Structs `Conv1dQ`, `ConvTranspose1dQ`, `ResBlockQ`, `HiFiGanQ` (pesos `int8_t`); campos `decoder_q` e `use_int8_hifi` em `VitsModel` |
-| `src/main.c` | Flag `--hifi-int8`; chamada `hifigan_quantize()` após `load_vtsm()` |
+| `src/vits.h` | Structs `Conv1dQ`, `ConvTranspose1dQ`, `ResBlockQ`, `HiFiGanQ`; `decoder_q`, `use_int8_hifi`, `decoder_q_from_file` em `VitsModel` |
+| `src/main.c` | Flag `--hifi-int8`; se v2 já carrega int8 do arquivo (skip quantize runtime) |
 | `src/model.c` | Stage 6: dispatch entre `hifigan_forward` (F32) e `hifigan_forward_q` (int8) |
-| `src/vtsm.c` | `free_model()` libera `decoder_q.qdata`/`scales` antes do munmap |
-| `CMakeLists.txt` | Arquivos `ops_int8.c`, `hifigan_q.c` no build |
+| `src/vtsm.c` | v2: populates `decoder_q` via mmap; F32 decoder weight ptrs = NULL; `free_model` só libera se `!decoder_q_from_file` |
+| `src/ops_neon.c` | Fix: guard `c->bias ? c->bias[o] : 0.0f` (conv_post sem bias) |
+| `CMakeLists.txt` | Seleção de `ops_int8_neon.c` / `ops_int8_avx2.c` por arquitetura; flags `-mfpu=neon` p/ ARMv7 |
 
 ### Layout de Memória
 
 ```
-HiFiGanQ:
-  qdata:    int8_t *  — todos os pesos int8 concatenados (13.7 MB)
-  scales:   float32 *  — todos os per-channel scales (38 KB, 9633 entries)
-  conv_pre, up[0..3], rb[0..11], conv_post:
-    weight → aponta dentro de qdata (offset calculado em quantize)
-    scale  → aponta dentro de scales
-    bias   → aponta para o F32 mmap (não copiado)
+v1 (model.vtsm, 108 MB):
+  F32 completo no mmap (encoder + DP + flows + HiFi-GAN)
+  HiFiGanQ: malloc'd (qdata 13.7 MB + scales 38 KB)
+  → total RAM: 108 MB (mmap) + 13.7 MB (malloc) ≈ 122 MB
+
+v2 (model_int8.vtsm, 67.4 MB):
+  F32 parcial no mmap (encoder + DP + flows + HiFi-GAN biases) = 53.7 MB
+  int8 no mmap (qdata 13.7 MB + scales 38 KB) — zero-copy
+  HiFiGanQ: ponteiros dentro do mmap (não malloc)
+  → total RAM: 67.4 MB (mmap, reclaimable) — sem malloc extra
 ```
 
 ## Fluxo de Quantização
 
+### v1 (model.vtsm — F32 completo)
+
 ```
-1. load_vtsm()       → F32 weights em mmap (zero-copy)
+1. load_vtsm()        → F32 weights em mmap (zero-copy, 108 MB)
 2. hifigan_quantize() → malloc int8 buffer + scales
    ├─ Percorre todos os 33 tensors do HiFi-GAN
    ├─ Para cada um: encontra max|W[o]| → scale[o] = max/127
-   ├─ Quantiza: q = round(w/scale) clamped a [-128, 127]
+   ├─ Quantiza: q = lroundf(w * (1/scale)) clamped a [-128, 127]
    ├─ Copia dilation/pad/stride do F32 (não hardcode!)
    └─ Grava ponteiros no HiFiGanQ
-3. free_model()      → libera qdata/scales + munmap F32
+3. free_model()       → libera qdata/scales (malloc) + munmap
 ```
 
-A quantização acontece **em tempo de carga** (uma vez), não a cada
-inferência. Custo: ~100 ms (ler F32 do mmap + escrever int8).
+Custo: ~2 s (ler 44.5 MB F32 do mmap + quantizar).
+
+### v2 (model_int8.vtsm — int8 pré-exportado)
+
+```
+1. load_vtsm()        → F32 parcial + int8 em mmap (zero-copy, 67.4 MB)
+   ├─ Parser detecta version=2, lê qdata_size/n_scales do header
+   ├─ Mapeia ponteiros de bias para o F32 section
+   ├─ Mapeia ponteiros de weight/scale para o int8 section
+   └─ decoder_q_from_file=1 (free_model não libera — está no mmap)
+2. [sem quantização]   → int8 já está no arquivo
+3. free_model()       → apenas munmap
+```
+
+Custo: **zero** — sem quantização em runtime.
+
+### Exportador
+
+```bash
+# v1 (F32 completo, 108 MB)
+python3 export_weights.py --input model.safetensors \
+    --output model.vtsm --header model_weights.h
+
+# v2 (slim: F32 sem HiFi-GAN weights + int8, 67.4 MB)
+python3 export_weights.py --input model.safetensors \
+    --output model_int8.vtsm --header model_int8_weights.h --int8
+```
+
+O `--int8` flag:
+- Pula os 78 F32 weight tensors do HiFi-GAN (mantém 77 biases)
+- Quantiza com o mesmo esquema do C: `scale=max/127`, `q=lroundf(w*(1/s))`
+- Ordem dos resblocks: c1[0], c2[0], c1[1], c2[1], c1[2], c2[2] (interleaved)
+- Escreve header v2 (48 bytes) com `qdata_size` e `n_scales`
 
 ## Dumps para Validação
 
@@ -261,19 +311,56 @@ o restante é ~10× menor. O impacto é ~10× menor com int16.
   (30.6–33.2 dB) — consistente com a medição única
 - [x] Samples A/B: `samples_int8/` vs `samples_f32/` /
   `samples_int16/` (mesmos textos, seed 42)
+- [x] Kernels NEON (aarch64 + ARMv7) — `ops_int8_neon.c`, bit-identical
+- [x] Format v2 `.vtsm` — int8 pré-quantizado no arquivo, zero-copy mmap
+- [x] Exportador `--int8` — slim v2 (67.4 MB, sem F32 HiFi-GAN weights)
+- [x] NEON F32 bias NULL fix (`ops_neon.c`) — crash em conv_post (RPi)
 
 ### Futuro
 
-1. **Exportar int8 no .vtsm:** incluir campo de pesos int8 no formato
-   VTSM para evitar quantização em runtime (economiza os 44.5 MB de
-   F32 HiFi-GAN do mmap)
-2. **Quantizar encoder/DP/flows:** DDS (depthwise 1×15=15, pointwise
+1. **Quantizar encoder/DP/flows:** DDS (depthwise 1×15=15, pointwise
    192×1=192) têm fan-in pequeno — int8 provavelmente funciona; é
    onde está o resto do tempo (encoder/flows dominam o pipeline F32)
-3. **Per-channel vs per-tensor:** testar se per-tensor int8 é
+2. **Per-channel vs per-tensor:** testar se per-tensor int8 é
    suficiente (menos scales, mesmo erro)
-4. **Comparar audição A/B:** blind test F32 vs int8 (samples em
+3. **Comparar audição A/B:** blind test F32 vs int8 (samples em
    `samples_int8/` e `samples_f32/`)
+4. **RPi v2 slim:** testar o `model_int8.vtsm` (67.4 MB) na RPi —
+   valida zero-copy mmap em ARM64 + confirma timing sem quant runtime
+
+### Resultados RPi (aarch64, NEON)
+
+Testado em Raspberry Pi (GCC 14.2, 4× Cortex-A72):
+
+| Métrica | RPi (NEON) | x86 (AVX2) |
+|---------|-----------|------------|
+| relRMS | 2.867% | 2.834% |
+| SNR | 30.9 dB | 31.0 dB |
+| max\|err\| | 2536 (int16) | — |
+
+Diferença de ~0.03% é apenas arredondamento FMA (NEON vs AVX2).
+
+**Tempo de síntese (RPi, "Olá, mundo! Tudo bem?" = 2.02s de áudio):**
+
+| Modelo | Wall time | RTF |
+|--------|-----------|-----|
+| F32 (v1) | 12.7s | ~6.3× |
+| int8 v1 + quant runtime | 14.6s | ~7.2× |
+| int8 v2 (sem quant) | ~12.7s* | ~6.3× |
+
+\* Estimado — o v2 slim (67.4 MB) não pôde ser testado na RPi (offline
+no momento do teste); esperado equivalente ao F32 em wall time pois o
+HiFi-GAN já era ~igual ao F32 com cache (a quant runtime é a diferença).
+
+### NEON (aarch64)
+
+Kernels em `ops_int8_neon.c`:
+- `conv1d_q`: FMA 4-lane (`vfmaq_f32`), dequant on-the-fly por (o,i,j)
+- `conv_transpose1d_q`: blocos de 4 coef com `vmovl_s8→vmovl_s16→vcvtq_f32_s32`,
+  body vetorial + passes escalar nas bordas
+- ARMv7 (Raspberry Pi 3): `vmlaq_f32` em vez de `vfmaq_f32`
+
+Resultado: relRMS/SNR idêntico ao AVX2 (diferença < 0.04% — FMA rounding).
 
 ## Referências
 

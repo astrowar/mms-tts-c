@@ -362,7 +362,7 @@ def build_export_plan(tensors: dict) -> List[TensorRec]:
 # ============================================================
 # Group tensors into sections for the header
 # ============================================================
-def group_sections(tensors: List[TensorRec]) -> List[SectionRec]:
+def group_sections(tensors: List[TensorRec], int8: bool = False) -> List[SectionRec]:
     """Group flat tensor list into logical sections."""
     sections: List[SectionRec] = []
 
@@ -400,12 +400,16 @@ def group_sections(tensors: List[TensorRec]) -> List[SectionRec]:
         idx += cl_count
 
     # HiFi-GAN decoder
-    dec_count = (2 + NUM_UP * 2 + 4 * 3 * RF_DILS * 4 + 1)  # conv_pre + ups + resblocks + conv_post
+    if int8:
+        # v2: only biases (weights replaced by int8 section)
+        dec_count = 1 + NUM_UP + 4 * 3 * RF_DILS * 2  # conv_pre.b + ups.b + rb biases
+    else:
+        dec_count = (2 + NUM_UP * 2 + 4 * 3 * RF_DILS * 4 + 1)
     sections.append(SectionRec(name="decoder", tensors=tensors[idx:idx + dec_count]))
     idx += dec_count
 
     # Compute offsets and totals
-    offset = HEADER_SIZE
+    offset = 48 if int8 else HEADER_SIZE
     for s in sections:
         s.offset = offset
         s.n_total = sum(t.n for t in s.tensors)
@@ -425,11 +429,17 @@ def group_sections(tensors: List[TensorRec]) -> List[SectionRec]:
 # ============================================================
 def export(tensors: dict, out_bin: str, out_header: str = None, int8: bool = False):
     plan = build_export_plan(tensors)
-    sections = group_sections(plan)
+
+    # v2: skip F32 HiFi-GAN weight tensors (replaced by int8 section)
+    if int8:
+        plan = [t for t in plan
+                if not (t.name.startswith("dec.") and t.name.endswith(".weight"))]
+
+    sections = group_sections(plan, int8=int8)
 
     total_floats = sum(t.n for t in plan)
     total_bytes = total_floats * 4
-    print(f"  tensors:     {len(plan)}")
+    print(f"  tensors:     {len(plan)}" + (" (v2: F32 hifi weights skipped)" if int8 else ""))
     print(f"  sections:    {len(sections)}")
     print(f"  total floats: {total_floats:,}")
     print(f"  total bytes:  {total_bytes:,} ({total_bytes / 1024 / 1024:.1f} MB)")

@@ -626,3 +626,70 @@ free(model)        →   ~0 MB (6.4 KB struct)
 inference (~133 MB), mas a memória **private** (irreclaimable) é apenas
 6.4 KB do struct. Todos os 108 MB de pesos são file-backed e podem ser
 evictados pelo kernel sem swap.
+
+## Quantização int8 (2026-09-07)
+
+### Status: ✅ Funcional (v1 + v2)
+
+HiFi-GAN quantizado per-output-channel simétrico int8, com kernels
+SIMD (AVX2 x86, NEON aarch64/ARMv7). Modo `--hifi-int8` é o modo
+quantizado padrão.
+
+| Propriedade | Valor |
+|-------------|-------|
+| Erro waveform (RMS) | 2.83% (31 dB SNR) |
+| Velocidade decoder | ~1.8× vs F32 |
+| Velocidade end-to-end | ~1.2× (encoder/flows dominam) |
+| Tamanho (v1, runtime quant) | 108 MB file + 13.7 MB malloc |
+| **Tamanho (v2, pré-quant)** | **67.4 MB file only (zero-copy)** |
+| ARM64 (RPi) | ✅ relRMS 2.867% (NEON) |
+
+### Arquivos
+
+| Arquivo | Papel |
+|---------|-------|
+| `src/ops_int8.c` | Kernels portáveis `conv1d_q` / `conv_transpose1d_q` (fallback) |
+| `src/ops_int8_avx2.c` | AVX2/FMA 8-lane (x86 + AVX2) |
+| `src/ops_int8_neon.c` | NEON 4-lane (aarch64 `vfmaq_f32`, ARMv7 `vmlaq_f32`) |
+| `src/hifigan_q.c` | `hifigan_quantize()`, `hifigan_forward_q()` |
+| `src/vtsm.c` | v1: quant runtime; v2: mmap zero-copy (sem quant) |
+| `export_weights.py` | `--int8` → v2 slim (67.4 MB) |
+| `quantization.md` | Documentação detalhada |
+
+### Formato v2
+
+```
+Offset  Size  Field
+------  ----  ----------------------------------------------------------
+0       4     magic "VTSM"
+4       4     version (uint32 LE = 2)
+8       4     vocab_size
+12      4     hidden_size
+16      8     total_data_size (F32 parcial, uint64)
+24      8     qdata_size (bytes int8, uint64)
+32      8     n_scales (uint64; C lê lower 32 bits)
+40      8     reserved
+48      ...   F32 data (encoder+DP+flows+HiFiGan biases, 53.7 MB)
+            ...   int8 qdata (13.7 MB)
+            ...   scales float32 (38 KB)
+```
+
+**Diferença v1 vs v2:**
+- v1: 488 F32 tensores (inclui HiFi-GAN weights) + quant runtime
+- v2: 410 F32 tensores (HiFi-GAN só biases) + int8 section → menor, sem quant
+
+### Builds
+
+```bash
+# v1 (F32 completo, quant runtime)
+cmake -B build -DENABLE_OMP=ON -DCMAKE_BUILD_TYPE=Release
+./build/mms-tts --text "..." --model model.vtsm --hifi-int8
+
+# v2 (slim, zero-copy, sem quant runtime)
+cmake -B build_int8 -DENABLE_OMP=ON -DCMAKE_BUILD_TYPE=Release \
+    -DINT8_WEIGHTS_HEADER=model_int8_weights.h
+./build_int8/mms-tts --text "..." --model model_int8.vtsm
+```
+
+**Nota:** v1 e v2 usam headers diferentes (`model_weights.h` vs
+`model_int8_weights.h`) porque têm nº de tensores distintos (488 vs 410).

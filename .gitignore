@@ -3,11 +3,13 @@
 c/mms-tts
 c/build*/
 
-# Model weights (108MB, regenerate with export_weights.py)
+# Model weights (regenerate with export_weights.py)
 c/model.vtsm
+c/model_int8.vtsm
 
 # Validation outputs (regenerate with make validate)
 c/ref_out/
+c/ref_por/
 c/c_out/
 c/c_out_f32/
 c/c_out_int8/
@@ -24,3 +26,4 @@ __pycache__/
 *.swp
 .vscode/
 .idea/
+.qwen/
