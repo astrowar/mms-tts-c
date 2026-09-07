@@ -17,14 +17,27 @@
  *   - weight_norm is already fused
  *   - ConvTranspose weights are already transposed to [out,in,k]
  *
- * File layout:
+ * v1 layout:
  *   [0..3]   magic "VTSM"
- *   [4..7]   version (uint32 LE)
+ *   [4..7]   version (uint32 LE) = 1
  *   [8..11]  vocab_size (uint32 LE)
  *   [12..15] hidden_size (uint32 LE)
  *   [16..23] total_data_size bytes (uint64 LE)
  *   [24..31] reserved (zero)
  *   [32..]   sequential float32 data
+ *
+ * v2 layout (with --int8):
+ *   [0..3]   magic "VTSM"
+ *   [4..7]   version (uint32 LE) = 2
+ *   [8..11]  vocab_size (uint32 LE)
+ *   [12..15] hidden_size (uint32 LE)
+ *   [16..23] total_data_size bytes (uint64 LE) [F32 data]
+ *   [24..31] qdata_size (uint64 LE) [int8 element count]
+ *   [32..39] n_scales (uint64 LE) [float32 scale count]
+ *   [40..47] reserved (zero)
+ *   [48..]   sequential float32 data
+ *   [...]    int8 HiFi-GAN weights
+ *   [...]    float32 per-channel scales
  * ============================================================ */
 
 /* Get a direct pointer into the mmap'd region (zero-copy) */
@@ -81,7 +94,7 @@ int load_vtsm(const char *path, VitsModel *model, Vocab *vocab)
         munmap((void *)buf, fsize);
         return -1;
     }
-    if (version != WTS_VERSION) {
+    if (version != 1 && version != 2) {
         fprintf(stderr, "[ERROR] unsupported version: %u\n", version);
         munmap((void *)buf, fsize);
         return -1;
@@ -105,9 +118,23 @@ int load_vtsm(const char *path, VitsModel *model, Vocab *vocab)
         munmap((void *)buf, fsize);
         return -1;
     }
-    if (fsize != WTS_FILE_HEADER_SIZE + (size_t)WTS_TOTAL_DATA_BYTES) {
-        fprintf(stderr, "[ERROR] file size %zu != expected %lu\n", fsize,
-                (unsigned long)(WTS_FILE_HEADER_SIZE + WTS_TOTAL_DATA_BYTES));
+
+    size_t hdr_size;
+    uint64_t qdata_size = 0, n_scales = 0;
+    if (version == 2) {
+        memcpy(&qdata_size, buf + 24, 8);
+        memcpy(&n_scales, buf + 32, 8);
+        hdr_size = 48;
+    } else {
+        hdr_size = WTS_FILE_HEADER_SIZE;  /* 32 */
+    }
+
+    size_t expected_size = hdr_size + (size_t)WTS_TOTAL_DATA_BYTES;
+    if (version == 2)
+        expected_size += (size_t)qdata_size + (size_t)(n_scales * 4);
+    if (fsize != expected_size) {
+        fprintf(stderr, "[ERROR] file size %zu != expected %zu\n", fsize,
+                expected_size);
         munmap((void *)buf, fsize);
         return -1;
     }
@@ -115,6 +142,15 @@ int load_vtsm(const char *path, VitsModel *model, Vocab *vocab)
     model->sampling_rate = SAMPLE_RATE;
     model->vtsm_map = buf;
     model->vtsm_map_size = fsize;
+
+    /*
+     * wts_tensors[] offsets are computed for v1 (data at byte 32).
+     * For v2 (48-byte header), shift the base by 16 so all offsets
+     * still point to the correct F32 data.
+     */
+    const unsigned char *file_base = buf;
+    if (version == 2)
+        buf += (size_t)(48 - WTS_FILE_HEADER_SIZE);
 
     /* ============================================================
      * Text Encoder
@@ -366,6 +402,116 @@ int load_vtsm(const char *path, VitsModel *model, Vocab *vocab)
         }
     }
 
+    /* ============================================================
+     * v2: Load pre-quantized int8 HiFi-GAN from file (zero-copy)
+     * ============================================================ */
+    if (version == 2 && qdata_size > 0) {
+        const unsigned char *qbase =
+            file_base + hdr_size + WTS_TOTAL_DATA_BYTES;
+        const unsigned char *sbase =
+            qbase + qdata_size;
+
+        HiFiGanQ *q = &model->decoder_q;
+        q->qdata = (int8_t *)(void *)qbase;
+        q->scales = (float *)(void *)sbase;
+        q->qdata_size = qdata_size;
+        q->n_scales = (int)n_scales;
+
+        size_t qoff = 0;
+        int soff = 0;
+
+        /* conv_pre */
+        {
+            Conv1dQ *cq = &q->conv_pre;
+            const Conv1d *cf = &model->decoder.conv_pre;
+            cq->in_ch = cf->in_ch;
+            cq->out_ch = cf->out_ch;
+            cq->k = cf->k;
+            cq->pad = cf->pad;
+            cq->dilation = cf->dilation;
+            cq->weight = q->qdata + qoff;
+            qoff += (size_t)cf->out_ch * cf->in_ch * cf->k;
+            cq->scale = q->scales + soff;
+            cq->bias = cf->bias;
+            soff += cf->out_ch;
+        }
+
+        /* upsamplers */
+        for (int i = 0; i < NUM_UP; i++) {
+            ConvTranspose1dQ *uq = &q->up[i];
+            const ConvTranspose1d *uf = &model->decoder.up[i];
+            uq->in_ch = uf->in_ch;
+            uq->out_ch = uf->out_ch;
+            uq->k = uf->k;
+            uq->stride = uf->stride;
+            uq->pad = uf->pad;
+            uq->weight = q->qdata + qoff;
+            qoff += (size_t)uf->out_ch * uf->in_ch * uf->k;
+            uq->scale = q->scales + soff;
+            uq->bias = uf->bias;
+            soff += uf->out_ch;
+        }
+
+        /* resblocks */
+        for (int r = 0; r < NUM_UP * RF_DILS; r++) {
+            ResBlockQ *rbq = &q->rb[r];
+            const ResBlock *rbf = &model->decoder.rb[r];
+            rbq->ch = rbf->ch;
+            rbq->kernel = rbf->kernel;
+            for (int d = 0; d < RF_DILS; d++)
+                rbq->dil[d] = rbf->dil[d];
+
+            for (int d = 0; d < RF_DILS; d++) {
+                Conv1dQ *cq = &rbq->c1[d];
+                const Conv1d *cf = &rbf->c1[d];
+                cq->in_ch = cf->in_ch;
+                cq->out_ch = cf->out_ch;
+                cq->k = cf->k;
+                cq->pad = cf->pad;
+                cq->dilation = cf->dilation;
+                cq->weight = q->qdata + qoff;
+                qoff += (size_t)cf->out_ch * cf->in_ch * cf->k;
+                cq->scale = q->scales + soff;
+                cq->bias = cf->bias;
+                soff += cf->out_ch;
+
+                cq = &rbq->c2[d];
+                cf = &rbf->c2[d];
+                cq->in_ch = cf->in_ch;
+                cq->out_ch = cf->out_ch;
+                cq->k = cf->k;
+                cq->pad = cf->pad;
+                cq->dilation = cf->dilation;
+                cq->weight = q->qdata + qoff;
+                qoff += (size_t)cf->out_ch * cf->in_ch * cf->k;
+                cq->scale = q->scales + soff;
+                cq->bias = cf->bias;
+                soff += cf->out_ch;
+            }
+        }
+
+        /* conv_post */
+        {
+            Conv1dQ *cq = &q->conv_post;
+            const Conv1d *cf = &model->decoder.conv_post;
+            cq->in_ch = cf->in_ch;
+            cq->out_ch = cf->out_ch;
+            cq->k = cf->k;
+            cq->pad = cf->pad;
+            cq->dilation = cf->dilation;
+            cq->weight = q->qdata + qoff;
+            qoff += (size_t)cf->out_ch * cf->in_ch * cf->k;
+            cq->scale = q->scales + soff;
+            cq->bias = cf->bias;  /* NULL */
+            soff += cf->out_ch;
+        }
+
+        model->use_int8_hifi = 1;
+        model->decoder_q_from_file = 1;
+        printf("  int8 HiFi-GAN loaded from file: %.1f MB (%d scales)\n",
+               qdata_size / (1024.0 * 1024.0), (int)n_scales);
+    }
+
     return 0;
 }
 
@@ -377,7 +523,7 @@ int load_vtsm(const char *path, VitsModel *model, Vocab *vocab)
 void free_model(VitsModel *model)
 {
     if (!model) return;
-    if (model->use_int8_hifi)
+    if (model->use_int8_hifi && !model->decoder_q_from_file)
         hifigan_free_q(&model->decoder_q);
     if (model->vtsm_map) {
         munmap((void *)model->vtsm_map, model->vtsm_map_size);

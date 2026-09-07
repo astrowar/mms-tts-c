@@ -234,9 +234,10 @@ typedef struct {
     /* HiFi-GAN decoder */
     HiFiGan decoder;
 
-    /* Int8 quantized HiFi-GAN (populated by hifigan_quantize) */
+    /* Int8 quantized HiFi-GAN (populated by hifigan_quantize or vtsm v2) */
     HiFiGanQ decoder_q;
     int use_int8_hifi;
+    int decoder_q_from_file;  /* 1 if qdata/scales are in vtsm_map (no free) */
 } VitsModel;
 
 /* ============================================================

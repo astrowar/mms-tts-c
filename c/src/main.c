@@ -104,8 +104,8 @@ int main(int argc, char **argv)
     model->sampling_rate = SAMPLE_RATE;
     printf("  sampling rate: %d Hz\n", model->sampling_rate);
 
-    /* Int8 HiFi-GAN quantization (from F32 mmap weights) */
-    if (hifi_int8) {
+    /* Int8 HiFi-GAN: use pre-quantized from file (v2) or quantize at runtime (v1) */
+    if (hifi_int8 && !model->use_int8_hifi) {
         printf("  quantizing HiFi-GAN to int8 (per-channel) ...\n");
         rc = hifigan_quantize(&model->decoder, &model->decoder_q);
         if (rc != 0) {

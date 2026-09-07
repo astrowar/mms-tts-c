@@ -169,15 +169,22 @@ QMAX = 127
 
 def quantize_conv_w(w: np.ndarray) -> Tuple[np.ndarray, np.ndarray]:
     """Quantize a [out_ch, in_ch, k] weight tensor.
-    Returns (int8_data, scales) where scales is [out_ch]."""
+    Matches C hifigan_quantize exactly: scale = max/127, v = w*(1/s), lroundf."""
+    w = w.astype(np.float32)
     out_ch = w.shape[0]
     scales = np.zeros(out_ch, dtype=np.float32)
     q = np.zeros_like(w, dtype=np.int8)
     for o in range(out_ch):
-        max_val = np.max(np.abs(w[o].astype(np.float32)))
-        s = max_val / QMAX if max_val > 1e-10 else 1.0
+        max_val = np.max(np.abs(w[o]))
+        s = np.float32(max_val / QMAX) if max_val > 1e-10 else np.float32(1.0)
         scales[o] = s
-        q[o] = np.clip(np.round(w[o] / s), -QMAX - 1, QMAX).astype(np.int8)
+        inv_scale = np.float32(1.0) / s
+        v = w[o] * inv_scale
+        # lroundf: round half away from zero
+        v_abs = np.abs(v)
+        rounded = np.sign(v) * np.floor(v_abs + np.float32(0.5)).astype(np.int32)
+        np.clip(rounded, -QMAX - 1, QMAX, out=rounded)
+        q[o] = rounded.astype(np.int8)
     return q, scales
 
 
@@ -202,14 +209,13 @@ def quantize_hifigan(tensors: dict) -> Tuple[bytes, bytes]:
         w = tensors[f"{dec}upsampler.{i}.weight"]
         add_q(np.transpose(w, (1, 0, 2)))
 
-    # resblocks: 4 stages × 3 MRF × (3 dil × c1 + 3 dil × c2)
+    # resblocks: 4 stages × 3 MRF, interleaved per dilation (c1[d], c2[d])
     for s in range(4):
         for kb in range(3):
             rb = s * 3 + kb
             base = f"{dec}resblocks.{rb}."
             for d in range(RF_DILS):
                 add_q(tensors[f"{base}convs1.{d}.weight"])
-            for d in range(RF_DILS):
                 add_q(tensors[f"{base}convs2.{d}.weight"])
 
     # conv_post: [1, 32, 7]
@@ -454,6 +460,7 @@ def export(tensors: dict, out_bin: str, out_header: str = None, int8: bool = Fal
         if int8:
             f.write(struct.pack("<Q", qdata_size))
             f.write(struct.pack("<Q", n_scales))
+            f.write(struct.pack("<Q", 0))  # reserved
         else:
             f.write(struct.pack("<Q", 0))  # reserved
 
