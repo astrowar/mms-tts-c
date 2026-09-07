@@ -9,6 +9,8 @@ c/model.vtsm
 # Validation outputs (regenerate with make validate)
 c/ref_out/
 c/c_out/
+c/c_out_f32/
+c/c_out_int8/
 
 # Generated audio (except committed samples)
 *.wav

@@ -163,6 +163,52 @@ typedef struct {
 } HiFiGan;
 
 /* ============================================================
+ * Quantized HiFi-GAN (int16 per-output-channel)
+ *
+ * Weights stored as int16 with per-output-channel float32 scale.
+ * Activations remain float32. Dequantization happens at the
+ * output of each conv:  out = acc * scale[o] + bias[o]
+ *
+ * int16 gives 32768 levels — ~267× better than int8.
+ * For fan-in=2816 (largest ResBlock conv), output error is
+ * ~0.08% of signal (vs ~26% for int8).
+ * ============================================================ */
+
+typedef struct {
+    int in_ch, out_ch, k, pad, dilation;
+    const int16_t *weight;    /* [out_ch][in_ch][k] */
+    const float   *scale;     /* [out_ch] */
+    float         *bias;      /* [out_ch] */
+} Conv1dQ;
+
+typedef struct {
+    int in_ch, out_ch, k, stride, pad;
+    const int16_t *weight;    /* [out_ch][in_ch][k] */
+    const float   *scale;     /* [out_ch] */
+    float         *bias;      /* [out_ch] */
+} ConvTranspose1dQ;
+
+typedef struct {
+    int ch, kernel;
+    int dil[RF_DILS];
+    Conv1dQ c1[RF_DILS];
+    Conv1dQ c2[RF_DILS];
+} ResBlockQ;
+
+typedef struct {
+    Conv1dQ conv_pre;         /* 192 -> 512, k=7 */
+    ConvTranspose1dQ up[NUM_UP];
+    ResBlockQ rb[12];         /* 4 stages x 3 MRF */
+    Conv1dQ conv_post;        /* 32 -> 1, k=7, no bias */
+
+    /* Quantized weight storage (allocated by hifigan_quantize) */
+    int16_t *qdata;           /* all int16 weights concatenated */
+    float   *scales;          /* all per-channel scales concatenated */
+    size_t qdata_size;        /* total int16 elements */
+    int     n_scales;         /* total scale entries */
+} HiFiGanQ;
+
+/* ============================================================
  * Full model
  * ============================================================ */
 typedef struct {
@@ -186,6 +232,10 @@ typedef struct {
 
     /* HiFi-GAN decoder */
     HiFiGan decoder;
+
+    /* Int8 quantized HiFi-GAN (populated by hifigan_quantize) */
+    HiFiGanQ decoder_q;
+    int use_int8_hifi;
 } VitsModel;
 
 /* ============================================================
@@ -224,6 +274,12 @@ void masked_axpy_f(float *dst, const float *src, const int *mask, int C, int T);
 void axpy_f(float *dst, const float *src, int n);
 void scal_f(float *x, int n, float alpha);
 float randn_f(void);
+
+/* --- ops_int8.c --- */
+void conv1d_q(const float *in, int in_ch, int T,
+              const Conv1dQ *c, float *out);
+void conv_transpose1d_q(const float *in, int in_ch, int T,
+                        const ConvTranspose1dQ *c, float *out, int *out_T);
 
 /* --- vtsm.c --- */
 int  load_vtsm(const char *path, VitsModel *model, Vocab *vocab);
@@ -269,6 +325,16 @@ void hifigan_forward(const HiFiGan *dec,
                      float *wave, int *wave_T);
 #ifdef ENABLE_DUMP
 void hifigan_set_dump_dir(const char *dir);
+#endif
+
+/* --- hifigan_q.c --- */
+int  hifigan_quantize(const HiFiGan *f32, HiFiGanQ *q);
+void hifigan_free_q(HiFiGanQ *q);
+void hifigan_forward_q(const HiFiGanQ *dec, const HiFiGan *f32,
+                       const float *mel, int mel_T,
+                       float *wave, int *wave_T);
+#ifdef ENABLE_DUMP
+void hifigan_q_set_dump_dir(const char *dir);
 #endif
 
 /* --- model.c --- */

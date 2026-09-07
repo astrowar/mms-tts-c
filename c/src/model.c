@@ -248,7 +248,11 @@ int vits_synthesize(const VitsModel *m, const Vocab *vocab,
     }
 
     /* ── Stage 6: HiFi-GAN Decoder ─────────────────────────────────── */
-    hifigan_forward(&m->decoder, latents, mel_T, waveform, wave_len);
+    if (m->use_int8_hifi) {
+        hifigan_forward_q(&m->decoder_q, &m->decoder, latents, mel_T, waveform, wave_len);
+    } else {
+        hifigan_forward(&m->decoder, latents, mel_T, waveform, wave_len);
+    }
 
     {
         int d1 = *wave_len;

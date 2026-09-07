@@ -368,6 +368,8 @@ int load_vtsm(const char *path, VitsModel *model, Vocab *vocab)
 void free_model(VitsModel *model)
 {
     if (!model) return;
+    if (model->use_int8_hifi)
+        hifigan_free_q(&model->decoder_q);
     if (model->vtsm_map) {
         munmap((void *)model->vtsm_map, model->vtsm_map_size);
         model->vtsm_map = NULL;
