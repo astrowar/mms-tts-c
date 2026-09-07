@@ -102,6 +102,14 @@ localidade de cache e o mesmo kernel FMA — o ganho do decoder é
 ~1.8×; end-to-end o ganho é ~20% porque encoder/DP/flows (F32)
 dominam o resto do pipeline.
 
+Com kernels AVX2 (`ops_int8_avx2.c`, x86 + AVX2/FMA): na máquina de
+dev (1 CPU) fica no empate com a versão portável — o build já compila
+`ops_int8.c` com `-mavx2 -mfma -O3` e `#pragma omp simd`, então a
+autovetorização do GCC já cobre 4-lane; o ganho do corpo 8-lane +
+FMA aparece mais em CPUs mais rápidas e com `OMP_NUM_THREADS>1`.
+Saída idêntica ao escalar a ~1e-3% (arredondamento FMA), validado
+kernel a kernel e no pipeline completo.
+
 **Paralelismo (OpenMP):** o build usa OpenMP (`-DENABLE_OMP=ON`);
 os kernels paralelizam por canal de saída quando o trabalho excede
 32768 FMA. Conda seta `OMP_NUM_THREADS=1` por padrão — para usar os
@@ -116,7 +124,8 @@ com 14 cores as camadas de conv grandes escalam.
 
 | Arquivo | Descrição |
 |---------|-----------|
-| `src/ops_int8.c` | `conv1d_q()` e `conv_transpose1d_q()` — kernel de convolução com pesos int8 |
+| `src/ops_int8.c` | `conv1d_q()` e `conv_transpose1d_q()` — kernel de convolução com pesos int8 (portável; usado sem AVX2) |
+| `src/ops_int8_avx2.c` | Mesma interface, vetorizada AVX2/FMA (8-lane em conv1d via FMA `x*(q*scale)` + bias na inicialização; transpose com blocos de 8/4 coeficientes convertidos int8→f32 uma vez por bloco, e passes escalar nos t's de borda onde o range por coeficiente diverge). Selecionada automaticamente no CMake em x86 + AVX2. |
 | `src/hifigan_q.c` | `hifigan_quantize()`, `hifigan_free_q()`, `hifigan_forward_q()` |
 
 ### Modificações
@@ -238,6 +247,7 @@ o restante é ~10× menor. O impacto é ~10× menor com int16.
 | 4 | stdio.h em #ifdef | erro compilação sem DUMP | mover include |
 | 5 | Dumps PyTorch vazios | ref_out sem 06_* | hooks no HiFi-GAN |
 | 6 | int8 descartado por medição contaminada | "28%/62% erro" | reavaliar após fix de dilation; int8 = 2.8% RMS |
+| 7 | AVX2 transpose descartava t's de borda (range único por bloco de 8/4 coef vs ranges por coeficiente) | 5.8–33% de erro nos 4 upsamplers | passes escalar por-coeficiente para os t's fora do range comum; corpo vetorial inalterado |
 
 ## Próximos Passos
 

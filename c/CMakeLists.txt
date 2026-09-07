@@ -20,12 +20,14 @@ option(ENABLE_OMP  "Build with OpenMP parallelism" OFF)
 include(CheckCCompilerFlag)
 
 set(OPS_SRC "${CMAKE_CURRENT_SOURCE_DIR}/src/ops_base.c")
+set(INT8_OPS_SRC "${CMAKE_CURRENT_SOURCE_DIR}/src/ops_int8.c")
 set(ARCH_FLAGS "")
 
 if(CMAKE_SYSTEM_PROCESSOR MATCHES "x86_64|AMD64|i686|i386")
     check_c_compiler_flag("-mavx2 -mfma" HAS_AVX2)
     if(HAS_AVX2)
         set(OPS_SRC "${CMAKE_CURRENT_SOURCE_DIR}/src/ops_avx.c")
+        set(INT8_OPS_SRC "${CMAKE_CURRENT_SOURCE_DIR}/src/ops_int8_avx2.c")
         set(ARCH_FLAGS "-mavx2;-mfma")
         message(STATUS "Architecture: x86_64 + AVX2/FMA")
     else()
@@ -53,7 +55,7 @@ endif()
 set(SRCS
     src/main.c
     ${OPS_SRC}
-    src/ops_int8.c
+    ${INT8_OPS_SRC}
     src/tokenizer.c
     src/encoder.c
     src/duration.c
@@ -108,5 +110,6 @@ endif()
 # ============================================================
 message(STATUS "Build type:  ${CMAKE_BUILD_TYPE}")
 message(STATUS "Ops source:  ${OPS_SRC}")
+message(STATUS "Int8 ops:    ${INT8_OPS_SRC}")
 message(STATUS "Dump:        ${ENABLE_DUMP}")
 message(STATUS "OMP:         ${ENABLE_OMP}")
