@@ -10,8 +10,9 @@ c/model.vtsm
 c/ref_out/
 c/c_out/
 
-# Generated audio
+# Generated audio (except committed samples)
 *.wav
+!samples/*.wav
 
 # Python
 __pycache__/
