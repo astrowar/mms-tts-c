@@ -5,7 +5,6 @@ c/build*/
 
 # Model weights (regenerate with export_weights.py)
 c/model.vtsm
-c/model_int8.vtsm
 
 # Validation outputs (regenerate with make validate)
 c/ref_out/

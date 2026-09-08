@@ -163,5 +163,5 @@ python3 ../validate/compare.py --ref-dir ../ref_out --c-dir ../c_out
 ## 📄 Notes
 
 - Non-deterministic by default (stochastic duration predictor). Use `--seed` for reproducible output.
-- `model.vtsm` is not committed (108 MB). Generate with `export_weights.py` or restore from backup.
-- Weight loading is a single `mmap` call — no parsing, no memcpy, no heap allocation for weights. All 488 tensor pointers reference the mapped file region directly. `free_model()` is a single `munmap`.
+- `model.vtsm` is not committed (67.4 MB). Generate with `export_weights.py` or restore from backup.
+- Weight loading is a single `mmap` call — no parsing, no memcpy, no heap allocation for weights. All 410 tensor pointers reference the mapped file region directly. `free_model()` is a single `munmap`.

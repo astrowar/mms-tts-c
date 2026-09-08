@@ -23,23 +23,27 @@ a partir dos pesos HuggingFace (`.safetensors`).
 
 | Formato | Magic | Extensão | Tamanho | Descrição |
 |---------|-------|----------|---------|-----------|
-| VTSM | `VTSM` | `.vtsm` | ~108 MB | Binário flat, pre-processado (weight_norm fused, ConvT transposed) |
+| VTSM v2 | `VTSM` | `.vtsm` | ~67.4 MB | F32 (encoder/DP/flows) + int8 HiFi-GAN, pre-processado |
 
 **Uso:** O `main.c` usa `load_vtsm()`. Se `--model` não for fornecido,
 procura `./model.vtsm` no diretório atual.
 
-### Formato VTSM
+### Formato VTSM (v2)
 
 ```
 Offset  Size  Field
 ------  ----  ----------------------------------------------------------
 0       4     magic bytes "VTSM"
-4       4     version (uint32 LE, currently 1)
+4       4     version (uint32 LE) = 2
 8       4     vocab_size (uint32 LE, = 43)
 12      4     hidden_size (uint32 LE, = 192)
-16      8     total_data_size in bytes (uint64 LE)
-24      8     reserved (zero)
-32      ...   sequential float32 data (113,583,072 bytes)
+16      8     total_data_size in bytes (uint64 LE) [F32 data only]
+24      8     qdata_size (uint64 LE) [int8 element count]
+32      8     n_scales (uint64 LE) [float32 scale count]
+40      8     reserved (zero)
+48      ...   sequential float32 tensor data
+...     ...   int8 HiFi-GAN weight data
+...     ...   float32 per-channel scales
 ```
 
 Todos os tensores já vêm pre-processados:
@@ -57,11 +61,11 @@ python3 export_weights.py \
 ```
 
 O script `export_weights.py` gera:
-1. **`model.vtsm`** — binário flat com todos os pesos (108 MB)
+1. **`model.vtsm`** — binário flat v2 (67.4 MB): F32 encoder/DP/flows + int8 HiFi-GAN
 2. **`model_weights.h`** — header C com:
    - Constantes de tamanho para cada tensor (`WTS_*_SIZE`)
    - Estruturas `WtsTensor` e `WtsSection`
-   - Tabela flat `wts_tensors[]` com offset/size de cada um dos 488 tensores
+   - Tabela flat `wts_tensors[]` com offset/size de cada um dos 410 tensores
    - Tabela `wts_sections[]` com os 18 agrupamentos lógicos
    - Índices `WTS_SEC_*` e helpers `wts_data()` / `wts_data_at()`
 
@@ -563,7 +567,7 @@ cmake .. -DENABLE_DUMP=ON -DCMAKE_BUILD_TYPE=Debug \
 
 | Fonte | Caminho | Tamanho |
 |-------|---------|---------|
-| VTSM (default) | `./model.vtsm` (diretório atual) | ~108 MB |
+| VTSM (default) | `./model.vtsm` (diretório atual) | ~67.4 MB |
 
 O `.vtsm` é o único formato suportado: binário flat com todos os pesos
 pre-processados (weight_norm fused, ConvTranspose transposed).
@@ -589,7 +593,7 @@ são ponteiros que apontam diretamente para a região mapeada — zero memcpy:
 **Como funciona:**
 
 ```
-mmap(model.vtsm)  →  região mapeada (108 MB, file-backed, reclaimable)
+mmap(model.vtsm)  →  região mapeada (67.4 MB, file-backed, reclaimable)
                          │
     embed_w ─────────────┤
     layers[0].attn.q_w ──┤
@@ -624,24 +628,23 @@ free(model)        →   ~0 MB (6.4 KB struct)
 
 **Nota:** o `ru_maxrss` (high-water mark) reflete o pico durante o
 inference (~133 MB), mas a memória **private** (irreclaimable) é apenas
-6.4 KB do struct. Todos os 108 MB de pesos são file-backed e podem ser
+6.4 KB do struct. Todos os 67.4 MB de pesos são file-backed e podem ser
 evictados pelo kernel sem swap.
 
 ## Quantização int8 (2026-09-07)
 
-### Status: ✅ Funcional (v1 + v2)
+### Status: ✅ Funcional (sempre ativo)
 
 HiFi-GAN quantizado per-output-channel simétrico int8, com kernels
-SIMD (AVX2 x86, NEON aarch64/ARMv7). Modo `--hifi-int8` é o modo
-quantizado padrão.
+SIMD (AVX2 x86, NEON aarch64/ARMv7). Int8 é sempre ativo; o v2
+carrega int8 pré-quantizado do arquivo (zero quant runtime).
 
 | Propriedade | Valor |
 |-------------|-------|
 | Erro waveform (RMS) | 2.83% (31 dB SNR) |
 | Velocidade decoder | ~1.8× vs F32 |
 | Velocidade end-to-end | ~1.2× (encoder/flows dominam) |
-| Tamanho (v1, runtime quant) | 108 MB file + 13.7 MB malloc |
-| **Tamanho (v2, pré-quant)** | **67.4 MB file only (zero-copy)** |
+| Tamanho | 67.4 MB file only (zero-copy) |
 | ARM64 (RPi) | ✅ relRMS 2.867% (NEON) |
 
 ### Arquivos
@@ -674,22 +677,11 @@ Offset  Size  Field
             ...   scales float32 (38 KB)
 ```
 
-**Diferença v1 vs v2:**
-- v1: 488 F32 tensores (inclui HiFi-GAN weights) + quant runtime
-- v2: 410 F32 tensores (HiFi-GAN só biases) + int8 section → menor, sem quant
+**410 F32 tensores (HiFi-GAN só biases) + int8 section → menor, sem quant runtime.**
 
 ### Builds
 
 ```bash
-# v1 (F32 completo, quant runtime)
-cmake -B build -DENABLE_OMP=ON -DCMAKE_BUILD_TYPE=Release
-./build/mms-tts --text "..." --model model.vtsm --hifi-int8
-
-# v2 (slim, zero-copy, sem quant runtime)
-cmake -B build_int8 -DENABLE_OMP=ON -DCMAKE_BUILD_TYPE=Release \
-    -DINT8_WEIGHTS_HEADER=model_int8_weights.h
-./build_int8/mms-tts --text "..." --model model_int8.vtsm
+cmake -B build -DCMAKE_BUILD_TYPE=Release
+./build/mms-tts --text "Olá, mundo!" --model model.vtsm
 ```
-
-**Nota:** v1 e v2 usam headers diferentes (`model_weights.h` vs
-`model_int8_weights.h`) porque têm nº de tensores distintos (488 vs 410).

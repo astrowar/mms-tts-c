@@ -4,18 +4,7 @@ Export MMS TTS (mms-tts-por) weights from safetensors to:
   1. A flat binary file (.vtsm) with all model weights
   2. A C header file (.h) describing the binary layout
 
-The .vtsm format (v1):
-  Offset  Size  Field
-  ------  ----  ----------------------------------------------------------
-  0       4     magic bytes "VTSM"
-  4       4     version (uint32 LE) = 1
-  8       4     vocab_size (uint32 LE)
-  12      4     hidden_size (uint32 LE)
-  16      8     total_data_size in bytes (uint64 LE)
-  24      8     reserved (zero)
-  32      ...   sequential float32 tensor data
-
-The .vtsm format (v2, with --int8):
+The .vtsm format (v2, int8 HiFi-GAN):
   Offset  Size  Field
   ------  ----  ----------------------------------------------------------
   0       4     magic bytes "VTSM"
@@ -409,7 +398,9 @@ def group_sections(tensors: List[TensorRec], int8: bool = False) -> List[Section
     idx += dec_count
 
     # Compute offsets and totals
-    offset = 48 if int8 else HEADER_SIZE
+    # Offsets are relative to a 32-byte virtual header in both v1/v2.
+    # The C loader adds 16 for v2's extra header fields (buf += 16).
+    offset = HEADER_SIZE
     for s in sections:
         s.offset = offset
         s.n_total = sum(t.n for t in s.tensors)
@@ -519,8 +510,7 @@ def gen_header(plan: List[TensorRec], sections: List[SectionRec], path: str,
     L(f" * Model: facebook/mms-tts-por (VITS, 36.3M params)")
     L(f" * DO NOT EDIT MANUALLY — regenerate with:")
     L(f" *   python export_weights.py --input model.safetensors \\")
-    L(f" *       --output model.vtsm --header {os.path.basename(path)}"
-        + (" --int8" if int8 else ""))
+    L(f" *       --output model.vtsm --header {os.path.basename(path)}")
     L(f" * ============================================================ */")
     L(f"")
     L(f"#ifndef MODEL_WEIGHTS_H")

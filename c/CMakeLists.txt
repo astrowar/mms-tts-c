@@ -91,9 +91,7 @@ target_link_libraries(mms-tts PRIVATE m)
 # Architecture-specific flags apply to SIMD ops files
 if(ARCH_FLAGS)
     set_source_files_properties(${OPS_SRC} PROPERTIES COMPILE_OPTIONS "${ARCH_FLAGS}")
-    if(INT8_OPS_SRC MATCHES "neon")
-        set_source_files_properties(${INT8_OPS_SRC} PROPERTIES COMPILE_OPTIONS "${ARCH_FLAGS}")
-    endif()
+    set_source_files_properties(${INT8_OPS_SRC} PROPERTIES COMPILE_OPTIONS "${ARCH_FLAGS}")
 endif()
 
 # model_weights.h dependency

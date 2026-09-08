@@ -5,8 +5,8 @@
 Reduzir o tamanho e custo de memória/computação dos pesos do HiFi-GAN
 (44.5 MB em F32) convertendo para inteiros, mantendo o erro de
 reconstrução da waveform aceitável. **Prioridade: velocidade de
-inferência** — o modo int8 (flag `--hifi-int8`) é o modo quantizado
-entregue; int16 é mantido como referência de precisão.
+inferência** — o modo int8 é o único caminho (sempre ativo); int16
+é mantido apenas como referência de precisão para validação.
 
 ## Estratégia de Quantização
 
@@ -94,8 +94,7 @@ na saída comprime os picos.
 
 | Versão | Conteúdo | Tamanho |
 |--------|----------|---------|
-| v1 (`model.vtsm`) | F32 completo (encoder+DP+flows+HiFi-GAN) | 108 MB |
-| **v2** (`model_int8.vtsm`) | F32 parcial (sem HiFi-GAN weights) + int8 | **67.4 MB** |
+| **v2** (`model.vtsm`) | F32 parcial (sem HiFi-GAN weights) + int8 | **67.4 MB** |
 
 O v2 elimina os 44.5 MB de F32 HiFi-GAN weights (redundantes com o
 int8) e não exige quantização em runtime.
@@ -138,15 +137,15 @@ com 14 cores as camadas de conv grandes escalam.
 | `src/ops_int8_avx2.c` | AVX2/FMA 8-lane. conv1d: FMA `x*(q*scale)`, bias na init. Transpose: blocos de 8/4 coef int8→f32 + passes escalar nos t's de borda. Selecionada em x86 + AVX2. |
 | `src/ops_int8_neon.c` | NEON 4-lane (aarch64: `vfmaq_f32`; ARMv7: `vmlaq_f32`). conv1d: FMA 4-float. Transpose: blocos de 4 coef com `vmovl_s8→vmovl_s16→vcvtq_f32_s32` + passes escalar nas bordas. Selecionada em ARM64/ARMv7+NEON. |
 | `src/hifigan_q.c` | `hifigan_quantize()`, `hifigan_free_q()`, `hifigan_forward_q()` |
-| `src/vtsm.c` | Loader v1/v2; v2 mapeia int8+scales do arquivo (zero-copy) |
-| `export_weights.py` | Exportador; `--int8` gera v2 com int8 pré-quantizado |
+| `src/vtsm.c` | Loader v2; mapeia F32 + int8 + scales do arquivo (zero-copy) |
+| `export_weights.py` | Exportador; gera v2 com int8 HiFi-GAN pré-quantizado |
 
 ### Modificações
 
 | Arquivo | Mudança |
 |---------|---------|
 | `src/vits.h` | Structs `Conv1dQ`, `ConvTranspose1dQ`, `ResBlockQ`, `HiFiGanQ`; `decoder_q`, `use_int8_hifi`, `decoder_q_from_file` em `VitsModel` |
-| `src/main.c` | Flag `--hifi-int8`; se v2 já carrega int8 do arquivo (skip quantize runtime) |
+| `src/main.c` | int8 sempre ativo; v2 carrega int8 do arquivo (zero runtime quantize) |
 | `src/model.c` | Stage 6: dispatch entre `hifigan_forward` (F32) e `hifigan_forward_q` (int8) |
 | `src/vtsm.c` | v2: populates `decoder_q` via mmap; F32 decoder weight ptrs = NULL; `free_model` só libera se `!decoder_q_from_file` |
 | `src/ops_neon.c` | Fix: guard `c->bias ? c->bias[o] : 0.0f` (conv_post sem bias) |
@@ -155,12 +154,7 @@ com 14 cores as camadas de conv grandes escalam.
 ### Layout de Memória
 
 ```
-v1 (model.vtsm, 108 MB):
-  F32 completo no mmap (encoder + DP + flows + HiFi-GAN)
-  HiFiGanQ: malloc'd (qdata 13.7 MB + scales 38 KB)
-  → total RAM: 108 MB (mmap) + 13.7 MB (malloc) ≈ 122 MB
-
-v2 (model_int8.vtsm, 67.4 MB):
+v2 (model.vtsm, 67.4 MB):
   F32 parcial no mmap (encoder + DP + flows + HiFi-GAN biases) = 53.7 MB
   int8 no mmap (qdata 13.7 MB + scales 38 KB) — zero-copy
   HiFiGanQ: ponteiros dentro do mmap (não malloc)
@@ -169,22 +163,7 @@ v2 (model_int8.vtsm, 67.4 MB):
 
 ## Fluxo de Quantização
 
-### v1 (model.vtsm — F32 completo)
-
-```
-1. load_vtsm()        → F32 weights em mmap (zero-copy, 108 MB)
-2. hifigan_quantize() → malloc int8 buffer + scales
-   ├─ Percorre todos os 33 tensors do HiFi-GAN
-   ├─ Para cada um: encontra max|W[o]| → scale[o] = max/127
-   ├─ Quantiza: q = lroundf(w * (1/scale)) clamped a [-128, 127]
-   ├─ Copia dilation/pad/stride do F32 (não hardcode!)
-   └─ Grava ponteiros no HiFiGanQ
-3. free_model()       → libera qdata/scales (malloc) + munmap
-```
-
-Custo: ~2 s (ler 44.5 MB F32 do mmap + quantizar).
-
-### v2 (model_int8.vtsm — int8 pré-exportado)
+### v2 (model.vtsm — int8 pré-exportado)
 
 ```
 1. load_vtsm()        → F32 parcial + int8 em mmap (zero-copy, 67.4 MB)
@@ -201,16 +180,11 @@ Custo: **zero** — sem quantização em runtime.
 ### Exportador
 
 ```bash
-# v1 (F32 completo, 108 MB)
 python3 export_weights.py --input model.safetensors \
     --output model.vtsm --header model_weights.h
-
-# v2 (slim: F32 sem HiFi-GAN weights + int8, 67.4 MB)
-python3 export_weights.py --input model.safetensors \
-    --output model_int8.vtsm --header model_int8_weights.h --int8
 ```
 
-O `--int8` flag:
+O exportador (sempre v2):
 - Pula os 78 F32 weight tensors do HiFi-GAN (mantém 77 biases)
 - Quantiza com o mesmo esquema do C: `scale=max/127`, `q=lroundf(w*(1/s))`
 - Ordem dos resblocks: c1[0], c2[0], c1[1], c2[1], c1[2], c2[2] (interleaved)
@@ -218,7 +192,7 @@ O `--int8` flag:
 
 ## Dumps para Validação
 
-Executar com `--hifi-int8 --dump-dir ./c_out_int8` gera:
+Executar com `--dump-dir ./c_out_int8` gera:
 
 | Dump | Conteúdo |
 |------|----------|
@@ -304,7 +278,7 @@ o restante é ~10× menor. O impacto é ~10× menor com int16.
 ### Feito ✓
 - [x] int8 quantização completa (conv_pre, upsamplers, 12 ResBlocks, conv_post)
 - [x] Validação por camada: 2.83% RMS (31 dB) na waveform
-- [x] Flag `--hifi-int8` funcional (modo quantizado padrão)
+- [x] int8 sempre ativo (modo quantizado padrão)
 - [x] Memory management (alloc em quantize, free em free_model)
 - [x] Velocidade: decoder ~1.8×, end-to-end −20% (single-thread)
 - [x] SNR em 3 utterances (`samples_int8/`): 2.18–2.94% RMS
@@ -313,7 +287,7 @@ o restante é ~10× menor. O impacto é ~10× menor com int16.
   `samples_int16/` (mesmos textos, seed 42)
 - [x] Kernels NEON (aarch64 + ARMv7) — `ops_int8_neon.c`, bit-identical
 - [x] Format v2 `.vtsm` — int8 pré-quantizado no arquivo, zero-copy mmap
-- [x] Exportador `--int8` — slim v2 (67.4 MB, sem F32 HiFi-GAN weights)
+- [x] Exportador — slim v2 (67.4 MB, sem F32 HiFi-GAN weights)
 - [x] NEON F32 bias NULL fix (`ops_neon.c`) — crash em conv_post (RPi)
 
 ### Futuro
@@ -325,7 +299,7 @@ o restante é ~10× menor. O impacto é ~10× menor com int16.
    suficiente (menos scales, mesmo erro)
 3. **Comparar audição A/B:** blind test F32 vs int8 (samples em
    `samples_int8/` e `samples_f32/`)
-4. **RPi v2 slim:** testar o `model_int8.vtsm` (67.4 MB) na RPi —
+4. **RPi v2 slim:** testar o `model.vtsm` (67.4 MB) na RPi —
    valida zero-copy mmap em ARM64 + confirma timing sem quant runtime
 
 ### Resultados RPi (aarch64, NEON)
