@@ -119,13 +119,22 @@ FMA aparece mais em CPUs mais rápidas e com `OMP_NUM_THREADS>1`.
 Saída idêntica ao escalar a ~1e-3% (arredondamento FMA), validado
 kernel a kernel e no pipeline completo.
 
-**Paralelismo (OpenMP):** o build usa OpenMP (`-DENABLE_OMP=ON`);
-os kernels paralelizam por canal de saída quando o trabalho excede
-32768 FMA. Conda seta `OMP_NUM_THREADS=1` por padrão — para usar os
-N cores: `export OMP_NUM_THREADS=14` (ou o nº de cores da máquina).
-Na máquina de dev deste repo (1 CPU efetiva por quota), 14 threads
-são contraproducentes (oversubscription: 14s vs 1s); em uma máquina
-com 14 cores as camadas de conv grandes escalam.
+**Paralelismo (OpenMP):** os kernels paralelizam por canal de saída
+quando o trabalho excede 32768 FMA. Para habilitar, configure o build
+com `-DENABLE_OMP=ON` (por padrão o `CMakeLists.txt` usa `OFF` — sem
+`-fopenmp`, os `#pragma omp` são ignorados e tudo roda em 1 thread).
+
+Conda seta `OMP_NUM_THREADS=1` por padrão — para usar N cores:
+`export OMP_NUM_THREADS=14` (ou o nº de cores da máquina).
+
+Scaling medido (HiFi-GAN, frase de 11.5s, 28 CPUs): 1→14 threads dá
+~8.4× (53.3s → 6.35s), quase linear. Saída bit-idêntica entre
+quantidades de threads.
+
+> Cuidado: o `nproc` do GNU **respeita `OMP_NUM_THREADS`** — com o
+> padrão do conda (`=1`) ele reporta `1` mesmo em máquina de 28 CPUs.
+> Use `nproc --all` ou `env -u OMP_NUM_THREADS nproc` para ver o
+> número real de CPUs.
 
 ## Arquitetura Implementada
 
