@@ -14,14 +14,15 @@
 
 ## 🎧 Samples
 
-> Generated with `--seed` for reproducibility. 16 kHz mono, 16-bit PCM.
+> Generated with the Q16 fixed-point HiFi-GAN (`--q16`) and `--seed 42`
+> for reproducibility. 16 kHz mono, 16-bit PCM.
 
 | Sample | Text | Duration |
 |--------|------|----------|
 | [hello.wav](samples/hello.wav) | "Olá, mundo!" | 1.3 s |
-| [bom_dia.wav](samples/bom_dia.wav) | "Bom dia, como você está hoje?" | 2.8 s |
-| [tech.wav](samples/tech.wav) | "A tecnologia de fala avança mais rápido do que imaginamos." | 5.4 s |
-| [embedded.wav](samples/embedded.wav) | "Este modelo roda em C puro, sem dependências externas, direto no hardware…" | 9.0 s |
+| [bom_dia.wav](samples/bom_dia.wav) | "Bom dia, como você está hoje?" | 2.5 s |
+| [tech.wav](samples/tech.wav) | "A tecnologia de fala avança mais rápido do que imaginamos." | 4.9 s |
+| [embedded.wav](samples/embedded.wav) | "Este modelo roda em C puro, sem dependências externas, direto no hardware…" | 13.0 s |
 
 <audio src="samples/hello.wav" controls preload="none"></audio>
 <audio src="samples/bom_dia.wav" controls preload="none"></audio>
