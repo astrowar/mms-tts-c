@@ -80,7 +80,7 @@ mms-tts-por/c/
 ├── model_weights.h        # Header C com layout (gerado)
 ├── src/
 │   ├── vits.h             # Structs, constantes, declarações
-│   ├── main.c             # CLI (--inject-dir, --dump-dir, --q16, etc.)
+│   ├── main.c             # CLI (--inject-dir, --dump-dir, --int8, etc.)
 │   ├── ops_base.c         # Ops escalar: conv1d, conv_transpose1d, depthwise, layernorm
 │   ├── ops_neon.c         # Ops otimizados NEON (aarch64 / ARMv7)
 │   ├── ops_avx.c          # Ops otimizados AVX2/FMA (x86_64)
@@ -756,8 +756,8 @@ Gerados por `calibrate_q16.py` (20 frases PT-BR, margin=0.85):
 cmake -B build_q16 -DCMAKE_BUILD_TYPE=Release
 make -C build_q16 -j$(nproc)
 
-# Sintetizar
-./build_q16/mms-tts --model model.vtsm --text "Olá, mundo!" --q16 --output out.wav
+# Sintetizar (Q16 é o default)
+./build_q16/mms-tts --model model.vtsm --text "Olá, mundo!" --output out.wav
 
 # Calibrar expoentes (requer transformers+torch)
 python3 calibrate_q16.py --margin 0.85 --output q16_exponents.txt

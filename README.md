@@ -9,41 +9,38 @@
 - **🔊 16 kHz 16-bit WAV** — direct output, no external upsample required
 - **🚫 Zero Dependencies** — single `mmap` for weight loading; F32 weights live entirely in the mapped file
 - **⚡ 67.4 MB flat binary** — v2 `.vtsm`, single file, no parsing, no copy — pointer arithmetic only
-- **🔢 Quantized HiFi-GAN** — INT8 (default) or Q16 fixed-point (INT16 activations, `--q16`); no float in the decoder hot path
+- **🔢 Quantized HiFi-GAN** — Q16 fixed-point (default, INT16 activations) or INT8+FP32 (`--int8`); no float in the decoder hot path
 - **🧮 Auto-vectorized** — CMake detects AVX2/NEON and picks optimized kernels
 - **✅ 100% Validated** — every F32 stage matches the HuggingFace Python reference (< 3e-3 rel. error)
 
 ## 🎧 Samples
 
-> Generated with the Q16 fixed-point HiFi-GAN (`--q16`) and `--seed 42`
+> Generated with the Q16 fixed-point HiFi-GAN (default) and `--seed 42`
 > for reproducibility. 16 kHz mono, 16-bit PCM.
 
-| Sample | Text | Duration |
-|--------|------|----------|
-| [hello.wav](samples/hello.wav) | "Olá, mundo!" | 1.3 s |
-| [bom_dia.wav](samples/bom_dia.wav) | "Bom dia, como você está hoje?" | 2.5 s |
-| [tech.wav](samples/tech.wav) | "A tecnologia de fala avança mais rápido do que imaginamos." | 4.9 s |
-| [embedded.wav](samples/embedded.wav) | "Este modelo roda em C puro, sem dependências externas, direto no hardware…" | 13.0 s |
+---
 
-<audio controls preload="none">
-  <source src="samples/hello.wav" type="audio/wav">
-  Your browser does not support the audio element.
-</audio>
+**hello** — "Olá, mundo!" · 1.3 s
 
-<audio controls preload="none">
-  <source src="samples/bom_dia.wav" type="audio/wav">
-  Your browser does not support the audio element.
-</audio>
+<audio controls preload="none" src="samples/hello.wav"></audio>
 
-<audio controls preload="none">
-  <source src="samples/tech.wav" type="audio/wav">
-  Your browser does not support the audio element.
-</audio>
+---
 
-<audio controls preload="none">
-  <source src="samples/embedded.wav" type="audio/wav">
-  Your browser does not support the audio element.
-</audio>
+**bom_dia** — "Bom dia, como você está hoje?" · 2.5 s
+
+<audio controls preload="none" src="samples/bom_dia.wav"></audio>
+
+---
+
+**tech** — "A tecnologia de fala avança mais rápido do que imaginamos." · 4.9 s
+
+<audio controls preload="none" src="samples/tech.wav"></audio>
+
+---
+
+**embedded** — "Este modelo roda em C puro, sem dependências externas, direto no hardware…" · 13.0 s
+
+<audio controls preload="none" src="samples/embedded.wav"></audio>
 
 ## 🚀 Quick Start
 
@@ -81,8 +78,11 @@ python3 c/export_weights.py \
 # Custom model path
 ./mms-tts --model /path/to/model.vtsm --text "Teste"
 
-# Fixed-point (INT16) HiFi-GAN — no float in the decoder
-./mms-tts --text "Olá, mundo!" --q16 --output hello_q16.wav
+# Fixed-point (INT16) HiFi-GAN — no float in the decoder (default)
+./mms-tts --text "Olá, mundo!" --output hello_q16.wav
+
+# Legacy INT8 + FP32 activations
+./mms-tts --text "Olá, mundo!" --int8 --output hello_int8.wav
 ```
 
 ## 📊 Performance
@@ -163,8 +163,8 @@ python3 ../validate/compare.py --ref-dir ../ref_out --c-dir ../c_out
 │   │   ├── encoder.c       # 6-layer transformer (rel. position attention)
 │   │   ├── duration.c      # Stochastic DP (DDS + RQS + ConvFlows)
 │   │   ├── flow.c          # WaveNet + residual coupling flow
-│   │   ├── hifigan_q.c     # INT8 HiFi-GAN vocoder (default; 4× upsample, MRF)
-│   │   ├── hifigan_q16.c   # Q16 fixed-point HiFi-GAN vocoder (--q16)
+│   │   ├── hifigan_q.c     # INT8 HiFi-GAN vocoder (--int8; 4× upsample, MRF)
+│   │   ├── hifigan_q16.c   # Q16 fixed-point HiFi-GAN vocoder (default)
 │   │   ├── hifigan.c       # F32 HiFi-GAN vocoder (legacy; not built by default)
 │   │   ├── vtsm.c          # Weight loader (v2: mmap F32 + int8, zero-copy)
 │   │   ├── model.c         # Pipeline orchestration
@@ -184,7 +184,7 @@ python3 ../validate/compare.py --ref-dir ../ref_out --c-dir ../c_out
 | Property | Value |
 |----------|-------|
 | Architecture | VITS (VAE + normalizing flow + HiFi-GAN) |
-| Parameters | 36.3M (encoder/flow F32; HiFi-GAN INT8 or Q16) |
+| Parameters | 36.3M (encoder/flow F32; HiFi-GAN Q16 or INT8) |
 | Sampling rate | 16 kHz |
 | Vocab | 43 characters (PT-BR) |
 | Weight format | `.vtsm` v2 (flat binary, **67.4 MB**) |

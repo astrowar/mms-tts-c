@@ -28,7 +28,7 @@ static void print_usage(const char *prog)
         "  --multi           Synthesize all sample texts\n"
         "  --dump-dir DIR    Dump intermediate tensors for validation\n"
         "  --inject-dir DIR  Inject pre-generated latents from DIR (e.g. ref_out/)\n"
-        "  --q16             Use fixed-point (INT16) HiFi-GAN pipeline\n"
+        "  --int8            Use INT8 + FP32 activations HiFi-GAN (default: Q16)\n"
         "  --help            Show this help\n"
         "\n"
         "Model: default is ./model.vtsm (generate with export_weights.py)\n"
@@ -38,7 +38,7 @@ static void print_usage(const char *prog)
         "  %s --text \"Bom dia\" --output bom_dia.wav --seed -1\n"
         "  %s --text \"Olá, mundo!\" --inject-dir ./ref_out\n"
         "  %s --multi --dump-dir ./c_out\n"
-        "  %s --text \"Olá, mundo!\" --q16 --output q16.wav\n",
+        "  %s --text \"Olá, mundo!\" --int8 --output int8.wav\n",
         prog, prog, prog, prog, prog, prog);
 }
 
@@ -51,7 +51,7 @@ int main(int argc, char **argv)
     const char *inject_dir = NULL;
     int seed = 42;
     int multi = 0;
-    int use_q16 = 0;
+    int use_q16 = 1;
 
     /* Parse args */
     for (int i = 1; i < argc; i++) {
@@ -69,8 +69,8 @@ int main(int argc, char **argv)
             dump_dir = argv[++i];
         else if (strcmp(argv[i], "--inject-dir") == 0 && i + 1 < argc)
             inject_dir = argv[++i];
-        else if (strcmp(argv[i], "--q16") == 0)
-            use_q16 = 1;
+        else if (strcmp(argv[i], "--int8") == 0)
+            use_q16 = 0;
         else if (strcmp(argv[i], "--help") == 0 || strcmp(argv[i], "-h") == 0) {
             print_usage(argv[0]);
             return 0;
