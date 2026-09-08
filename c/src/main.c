@@ -9,6 +9,60 @@ void set_dump_dir(const char *dir);
 /* Default model path */
 static const char *DEFAULT_MODEL = "model.vtsm";
 
+/* ── Text chunking ──────────────────────────────────────────────────────
+ * Splits text at sentence boundaries (. ? ! \n) into chunks of at most
+ * MAX_TEXT_LEN characters. Each chunk is independently synthesizable. */
+
+#define MAX_CHUNKS 16
+
+static int split_text(const char *text, char (*chunks)[MAX_TEXT_LEN + 1], int *lens)
+{
+    int n = 0;
+    size_t len = strlen(text);
+    size_t pos = 0;
+
+    while (pos < len && n < MAX_CHUNKS) {
+        /* If remaining fits in one chunk, take it all */
+        if (len - pos <= (size_t)MAX_TEXT_LEN) {
+            size_t slen = len - pos;
+            memcpy(chunks[n], text + pos, slen);
+            chunks[n][slen] = '\0';
+            lens[n] = (int)slen;
+            n++;
+            break;
+        }
+
+        /* Find a good break point: last sentence-ending char within limit */
+        size_t limit = pos + (size_t)MAX_TEXT_LEN;
+        size_t break_at = pos; /* fallback: hard cut */
+        for (size_t i = pos; i < limit; i++) {
+            if (text[i] == '.' || text[i] == '?' || text[i] == '!' || text[i] == '\n') {
+                break_at = i + 1;
+            }
+        }
+        /* If no sentence break found, break at last space */
+        if (break_at == pos) {
+            for (size_t i = limit; i > pos; i--) {
+                if (text[i - 1] == ' ') {
+                    break_at = i - 1;
+                    break;
+                }
+            }
+        }
+        if (break_at == pos)
+            break_at = limit; /* hard cut as last resort */
+
+        size_t slen = break_at - pos;
+        memcpy(chunks[n], text + pos, slen);
+        chunks[n][slen] = '\0';
+        lens[n] = (int)slen;
+        n++;
+        pos = break_at;
+    }
+
+    return n;
+}
+
 static const char *SAMPLE_TEXTS[] = {
     "Olá, mundo! Este é um exemplo de síntese de voz em português.",
     "A tecnologia de fala tem avançado rapidamente nos últimos anos.",
@@ -154,32 +208,96 @@ int main(int argc, char **argv)
     int sample_rate = model->sampling_rate;
 
     for (int i = 0; i < n_texts; i++) {
-        int display_len = (int)strlen(texts[i]);
-        if (display_len > 60) display_len = 60;
-        printf("[%d/%d] \"%s%s\"\n", i + 1, n_texts, texts[i],
-               (int)strlen(texts[i]) > 60 ? "..." : "");
+        int text_len = (int)strlen(texts[i]);
+        printf("[%d/%d] \"%s%s\" (%d chars)\n", i + 1, n_texts, texts[i],
+               text_len > 60 ? "..." : "", text_len);
 
-        waveforms[i] = (float *)malloc(sizeof(float) * MAX_WAV_LEN);
-        if (!waveforms[i]) {
-            fprintf(stderr, "Error: out of memory\n");
-            for (int j = 0; j < i; j++) free(waveforms[j]);
-            free_model(model);
-            free(model);
-            return 1;
+        int need_chunking = text_len > MAX_TEXT_LEN;
+        char chunks[MAX_CHUNKS][MAX_TEXT_LEN + 1];
+        int chunk_lens[MAX_CHUNKS];
+        int n_chunks = 1;
+
+        if (need_chunking) {
+            n_chunks = split_text(texts[i], chunks, chunk_lens);
+            if (n_chunks <= 0) {
+                fprintf(stderr, "  Error: could not split text\n");
+                for (int j = 0; j < i; j++) free(waveforms[j]);
+                free_model(model);
+                free(model);
+                return 1;
+            }
+            printf("  split into %d chunks\n", n_chunks);
+        } else {
+            memcpy(chunks[0], texts[i], text_len + 1);
+            chunk_lens[0] = text_len;
         }
 
-        int rc = use_q16
-            ? vits_synthesize_pipeline(model, &vocab, texts[i], seed,
-                                       inject_dir, waveforms[i], &wave_lens[i], 1)
-            : vits_synthesize(model, &vocab, texts[i], seed,
-                              inject_dir, waveforms[i], &wave_lens[i]);
-        if (rc != 0) {
-            fprintf(stderr, "  Error: synthesis failed\n");
-            free(waveforms[i]);
-            for (int j = 0; j < i; j++) free(waveforms[j]);
-            free_model(model);
-            free(model);
-            return 1;
+        if (n_chunks == 1) {
+            /* Single chunk: synthesize directly into output buffer */
+            waveforms[i] = (float *)malloc(sizeof(float) * MAX_WAV_LEN);
+            if (!waveforms[i]) {
+                fprintf(stderr, "Error: out of memory\n");
+                for (int j = 0; j < i; j++) free(waveforms[j]);
+                free_model(model);
+                free(model);
+                return 1;
+            }
+
+            int rc = use_q16
+                ? vits_synthesize_pipeline(model, &vocab, chunks[0], seed,
+                                           inject_dir, waveforms[i], &wave_lens[i], 1)
+                : vits_synthesize(model, &vocab, chunks[0], seed,
+                                  inject_dir, waveforms[i], &wave_lens[i]);
+            if (rc != 0) {
+                fprintf(stderr, "  Error: synthesis failed\n");
+                free(waveforms[i]);
+                for (int j = 0; j < i; j++) free(waveforms[j]);
+                free_model(model);
+                free(model);
+                return 1;
+            }
+        } else {
+            /* Multiple chunks: synthesize each, then concatenate */
+            waveforms[i] = (float *)malloc(sizeof(float) * MAX_WAV_LEN * n_chunks);
+            if (!waveforms[i]) {
+                fprintf(stderr, "Error: out of memory\n");
+                for (int j = 0; j < i; j++) free(waveforms[j]);
+                free_model(model);
+                free(model);
+                return 1;
+            }
+            wave_lens[i] = 0;
+
+            float *tmp = (float *)malloc(sizeof(float) * MAX_WAV_LEN);
+            if (!tmp) {
+                fprintf(stderr, "Error: out of memory\n");
+                free(waveforms[i]);
+                for (int j = 0; j < i; j++) free(waveforms[j]);
+                free_model(model);
+                free(model);
+                return 1;
+            }
+
+            for (int c = 0; c < n_chunks; c++) {
+                int chunk_wave_len = 0;
+                int rc = use_q16
+                    ? vits_synthesize_pipeline(model, &vocab, chunks[c], seed,
+                                               inject_dir, tmp, &chunk_wave_len, 1)
+                    : vits_synthesize(model, &vocab, chunks[c], seed,
+                                      inject_dir, tmp, &chunk_wave_len);
+                if (rc != 0) {
+                    fprintf(stderr, "  Error: synthesis failed (chunk %d)\n", c + 1);
+                    free(tmp);
+                    free(waveforms[i]);
+                    for (int j = 0; j < i; j++) free(waveforms[j]);
+                    free_model(model);
+                    free(model);
+                    return 1;
+                }
+                memcpy(waveforms[i] + wave_lens[i], tmp, chunk_wave_len * sizeof(float));
+                wave_lens[i] += chunk_wave_len;
+            }
+            free(tmp);
         }
 
         double duration = (double)wave_lens[i] / sample_rate;
