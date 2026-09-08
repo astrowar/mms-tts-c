@@ -12,7 +12,7 @@ endif()
 # Options
 # ============================================================
 option(ENABLE_DUMP "Build with validation dump support" OFF)
-option(ENABLE_OMP  "Build with OpenMP parallelism" OFF)
+option(ENABLE_OMP  "Build with OpenMP parallelism" ON)
 
 # ============================================================
 # Architecture detection

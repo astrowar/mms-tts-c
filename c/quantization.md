@@ -120,9 +120,10 @@ Saída idêntica ao escalar a ~1e-3% (arredondamento FMA), validado
 kernel a kernel e no pipeline completo.
 
 **Paralelismo (OpenMP):** os kernels paralelizam por canal de saída
-quando o trabalho excede 32768 FMA. Para habilitar, configure o build
-com `-DENABLE_OMP=ON` (por padrão o `CMakeLists.txt` usa `OFF` — sem
-`-fopenmp`, os `#pragma omp` são ignorados e tudo roda em 1 thread).
+quando o trabalho excede 32768 FMA. OpenMP está **ON por padrão** no
+`CMakeLists.txt` (`-fopenmp`); desative com `-DENABLE_OMP=OFF` se
+preferir (sem ele, os `#pragma omp` são ignorados e tudo roda em
+1 thread).
 
 Conda seta `OMP_NUM_THREADS=1` por padrão — para usar N cores:
 `export OMP_NUM_THREADS=14` (ou o nº de cores da máquina).
