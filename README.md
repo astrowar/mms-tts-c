@@ -20,13 +20,13 @@
 
 ---
 
-**hello** — "Olá, mundo!" · 1.3 s → [▶ play](samples/hello.wav)
+**hello** — "Olá, mundo!" · 1.3 s → [▶ play](https://raw.githubusercontent.com/astrowar/mms-tts-c/int8/samples/hello.wav)
 
-**bom_dia** — "Bom dia, como você está hoje?" · 2.5 s → [▶ play](samples/bom_dia.wav)
+**bom_dia** — "Bom dia, como você está hoje?" · 2.5 s → [▶ play](https://raw.githubusercontent.com/astrowar/mms-tts-c/int8/samples/bom_dia.wav)
 
-**tech** — "A tecnologia de fala avança mais rápido do que imaginamos." · 4.9 s → [▶ play](samples/tech.wav)
+**tech** — "A tecnologia de fala avança mais rápido do que imaginamos." · 4.9 s → [▶ play](https://raw.githubusercontent.com/astrowar/mms-tts-c/int8/samples/tech.wav)
 
-**embedded** — "Este modelo roda em C puro, sem dependências externas, direto no hardware…" · 13.0 s → [▶ play](samples/embedded.wav)
+**embedded** — "Este modelo roda em C puro, sem dependências externas, direto no hardware…" · 13.0 s → [▶ play](https://raw.githubusercontent.com/astrowar/mms-tts-c/int8/samples/embedded.wav)
 
 ## 🚀 Quick Start
 
