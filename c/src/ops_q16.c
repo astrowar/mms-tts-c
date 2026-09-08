@@ -78,6 +78,13 @@ void conv1d_q16(
 
     const int shift = Q16_ALPHA_BITS - 1;
 
+    /* Accumulator rows allocated up front (structured-block safe); each
+       `o` uses its own disjoint slice of length T. */
+    int32_t *acc_all =
+        (int32_t *)malloc(sizeof(int32_t) * (size_t)out_ch * (size_t)T);
+    if (!acc_all)
+        return;
+
 #ifdef _OPENMP
     const size_t work =
         (size_t)out_ch * (size_t)in_ch * (size_t)k * (size_t)T;
@@ -92,9 +99,7 @@ void conv1d_q16(
         const int8_t  *VITS_RESTRICT w_o =
             c->weight + (size_t)o * in_ch * k;
 
-        int32_t *VITS_RESTRICT acc =
-            (int32_t *)malloc(sizeof(int32_t) * (size_t)T);
-        if (!acc) return;
+        int32_t *VITS_RESTRICT acc = acc_all + (size_t)o * T;
 
         for (int t = 0; t < T; t++)
             acc[t] = 0;
@@ -130,9 +135,8 @@ void conv1d_q16(
             result += bias_o;
             out_o[t] = saturate_i16(result);
         }
-
-        free(acc);
     }
+    free(acc_all);
 }
 
 /* ============================================================
@@ -169,6 +173,13 @@ void conv_transpose1d_q16(
 
     const int shift = Q16_ALPHA_BITS - 1;
 
+    /* Accumulator rows allocated up front (structured-block safe); each
+       `o` uses its own disjoint slice of length oT. */
+    int32_t *acc_all =
+        (int32_t *)malloc(sizeof(int32_t) * (size_t)out_ch * (size_t)oT);
+    if (!acc_all)
+        return;
+
 #ifdef _OPENMP
     const size_t work =
         (size_t)out_ch * (size_t)in_ch * (size_t)T * (size_t)k;
@@ -183,9 +194,7 @@ void conv_transpose1d_q16(
         const int8_t  *VITS_RESTRICT w_o =
             c->weight + (size_t)o * in_ch * k;
 
-        int32_t *VITS_RESTRICT acc =
-            (int32_t *)malloc(sizeof(int32_t) * (size_t)oT);
-        if (!acc) return;
+        int32_t *VITS_RESTRICT acc = acc_all + (size_t)o * oT;
 
         for (int t = 0; t < oT; t++)
             acc[t] = 0;
@@ -229,9 +238,8 @@ void conv_transpose1d_q16(
             result += bias_o;
             out_o[t] = saturate_i16(result);
         }
-
-        free(acc);
     }
+    free(acc_all);
 }
 
 /* ============================================================
