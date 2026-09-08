@@ -20,33 +20,13 @@
 
 ---
 
-**hello** — "Olá, mundo!" · 1.3 s
+**hello** — "Olá, mundo!" · 1.3 s → [▶ play](samples/hello.wav)
 
-<audio controls preload="none">
-  <source src="samples/hello.wav" type="audio/wav">
-  Your browser does not support the audio element.
-</audio>
+**bom_dia** — "Bom dia, como você está hoje?" · 2.5 s → [▶ play](samples/bom_dia.wav)
 
-**bom_dia** — "Bom dia, como você está hoje?" · 2.5 s
+**tech** — "A tecnologia de fala avança mais rápido do que imaginamos." · 4.9 s → [▶ play](samples/tech.wav)
 
-<audio controls preload="none">
-  <source src="samples/bom_dia.wav" type="audio/wav">
-  Your browser does not support the audio element.
-</audio>
-
-**tech** — "A tecnologia de fala avança mais rápido do que imaginamos." · 4.9 s
-
-<audio controls preload="none">
-  <source src="samples/tech.wav" type="audio/wav">
-  Your browser does not support the audio element.
-</audio>
-
-**embedded** — "Este modelo roda em C puro, sem dependências externas, direto no hardware…" · 13.0 s
-
-<audio controls preload="none">
-  <source src="samples/embedded.wav" type="audio/wav">
-  Your browser does not support the audio element.
-</audio>
+**embedded** — "Este modelo roda em C puro, sem dependências externas, direto no hardware…" · 13.0 s → [▶ play](samples/embedded.wav)
 
 ## 🚀 Quick Start
 
