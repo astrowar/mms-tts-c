@@ -65,7 +65,7 @@ int load_vtsm(const char *path, VitsModel *model, Vocab *vocab)
     }
 
     size_t fsize = (size_t)st.st_size;
-    if (fsize < WTS_FILE_HEADER_SIZE) {
+    if (fsize < 48) {
         fprintf(stderr, "[ERROR] file too small (%zu bytes)\n", fsize);
         close(fd);
         return -1;
@@ -94,8 +94,8 @@ int load_vtsm(const char *path, VitsModel *model, Vocab *vocab)
         munmap((void *)buf, fsize);
         return -1;
     }
-    if (version != 1 && version != 2) {
-        fprintf(stderr, "[ERROR] unsupported version: %u\n", version);
+    if (version != 2) {
+        fprintf(stderr, "[ERROR] unsupported version: %u (only v2 supported)\n", version);
         munmap((void *)buf, fsize);
         return -1;
     }
@@ -111,27 +111,13 @@ int load_vtsm(const char *path, VitsModel *model, Vocab *vocab)
         munmap((void *)buf, fsize);
         return -1;
     }
-    size_t hdr_size;
-    uint64_t qdata_size = 0, n_scales = 0;
-    if (version == 2) {
-        memcpy(&qdata_size, buf + 24, 8);
-        memcpy(&n_scales, buf + 32, 8);
-        hdr_size = 48;
-    } else {
-        hdr_size = WTS_FILE_HEADER_SIZE;  /* 32 */
-        /* v1: validate against compiled-in expected size */
-        if (total_bytes != WTS_TOTAL_DATA_BYTES) {
-            fprintf(stderr, "[ERROR] data size mismatch: %lu (expected %lu)\n",
-                    (unsigned long)total_bytes,
-                    (unsigned long)WTS_TOTAL_DATA_BYTES);
-            munmap((void *)buf, fsize);
-            return -1;
-        }
-    }
+    const size_t hdr_size = 48;
+    uint64_t qdata_size, n_scales;
+    memcpy(&qdata_size, buf + 24, 8);
+    memcpy(&n_scales, buf + 32, 8);
 
-    size_t expected_size = hdr_size + (size_t)total_bytes;
-    if (version == 2)
-        expected_size += (size_t)qdata_size + (size_t)(n_scales * 4);
+    size_t expected_size = hdr_size + (size_t)total_bytes
+                         + (size_t)qdata_size + (size_t)(n_scales * 4);
     if (fsize != expected_size) {
         fprintf(stderr, "[ERROR] file size %zu != expected %zu\n", fsize,
                 expected_size);
@@ -144,13 +130,11 @@ int load_vtsm(const char *path, VitsModel *model, Vocab *vocab)
     model->vtsm_map_size = fsize;
 
     /*
-     * wts_tensors[] offsets are computed for v1 (data at byte 32).
-     * For v2 (48-byte header), shift the base by 16 so all offsets
-     * still point to the correct F32 data.
+     * wts_tensors[] offsets were computed with data at byte 32.
+     * v2 has a 48-byte header, so shift base by 16.
      */
     const unsigned char *file_base = buf;
-    if (version == 2)
-        buf += (size_t)(48 - WTS_FILE_HEADER_SIZE);
+    buf += 16;
 
     /* ============================================================
      * Text Encoder
@@ -322,146 +306,78 @@ int load_vtsm(const char *path, VitsModel *model, Vocab *vocab)
         static const int rb_k[]  = {3, 7, 11};
         static const int rb_dil[] = {1, 3, 5};
 
-        if (version == 2) {
-            /*
-             * v2: decoder section has only biases (77 tensors).
-             * F32 weights are not in the file (replaced by int8).
-             * Layout: conv_pre.b, up[0..3].b, rb biases (c1[0].b, c2[0].b, ...)
-             */
-            int base = 333;
-            int tidx = 0;
+        /*
+         * Decoder section: only biases (77 tensors).
+         * F32 weights are not in the file (replaced by int8).
+         * Layout: conv_pre.b, up[0..3].b, rb biases (c1[0].b, c2[0].b, ...)
+         */
+        int base = 333;
+        int tidx = 0;
 
-            model->decoder.conv_pre.in_ch = HIDDEN;
-            model->decoder.conv_pre.out_ch = HIFI_INIT_CH;
-            model->decoder.conv_pre.k = 7;
-            model->decoder.conv_pre.pad = 3;
-            model->decoder.conv_pre.dilation = 1;
-            model->decoder.conv_pre.weight = NULL;
-            model->decoder.conv_pre.bias = ptr_at(buf, wts_tensors[base + tidx++].offset);
+        model->decoder.conv_pre.in_ch = HIDDEN;
+        model->decoder.conv_pre.out_ch = HIFI_INIT_CH;
+        model->decoder.conv_pre.k = 7;
+        model->decoder.conv_pre.pad = 3;
+        model->decoder.conv_pre.dilation = 1;
+        model->decoder.conv_pre.weight = NULL;
+        model->decoder.conv_pre.bias = ptr_at(buf, wts_tensors[base + tidx++].offset);
 
-            for (int i = 0; i < NUM_UP; i++) {
-                model->decoder.up[i].in_ch = up_in[i];
-                model->decoder.up[i].out_ch = up_out[i];
-                model->decoder.up[i].k = up_k[i];
-                model->decoder.up[i].stride = up_s[i];
-                model->decoder.up[i].pad = up_p[i];
-                model->decoder.up[i].weight = NULL;
-                model->decoder.up[i].bias = ptr_at(buf, wts_tensors[base + tidx++].offset);
-            }
-
-            for (int stage = 0; stage < 4; stage++) {
-                for (int kb = 0; kb < 3; kb++) {
-                    ResBlock *rb = &model->decoder.rb[stage * 3 + kb];
-                    rb->ch = rb_ch[stage];
-                    rb->kernel = rb_k[kb];
-                    for (int d = 0; d < RF_DILS; d++)
-                        rb->dil[d] = rb_dil[d];
-
-                    for (int d = 0; d < RF_DILS; d++) {
-                        int k = rb_k[kb];
-                        int ch = rb_ch[stage];
-                        int dil = rb_dil[d];
-
-                        rb->c1[d].in_ch = ch;
-                        rb->c1[d].out_ch = ch;
-                        rb->c1[d].k = k;
-                        rb->c1[d].pad = dil * (k - 1) / 2;
-                        rb->c1[d].dilation = dil;
-                        rb->c1[d].weight = NULL;
-                        rb->c1[d].bias = ptr_at(buf, wts_tensors[base + tidx++].offset);
-
-                        rb->c2[d].in_ch = ch;
-                        rb->c2[d].out_ch = ch;
-                        rb->c2[d].k = k;
-                        rb->c2[d].pad = (k - 1) / 2;
-                        rb->c2[d].dilation = 1;
-                        rb->c2[d].weight = NULL;
-                        rb->c2[d].bias = ptr_at(buf, wts_tensors[base + tidx++].offset);
-                    }
-                }
-            }
-
-            /* conv_post: no bias, weight is NULL */
-            model->decoder.conv_post.in_ch = rb_ch[3];
-            model->decoder.conv_post.out_ch = 1;
-            model->decoder.conv_post.k = 7;
-            model->decoder.conv_post.pad = 3;
-            model->decoder.conv_post.dilation = 1;
-            model->decoder.conv_post.weight = NULL;
-            model->decoder.conv_post.bias = NULL;
-        } else {
-            /* v1: full F32 decoder (weights + biases) */
-            int base = 333;
-
-            model->decoder.conv_pre.in_ch = HIDDEN;
-            model->decoder.conv_pre.out_ch = HIFI_INIT_CH;
-            model->decoder.conv_pre.k = 7;
-            model->decoder.conv_pre.pad = 3;
-            model->decoder.conv_pre.dilation = 1;
-            model->decoder.conv_pre.weight = ptr_at(buf, wts_tensors[base + 0].offset);
-            model->decoder.conv_pre.bias = ptr_at(buf, wts_tensors[base + 1].offset);
-
-            for (int i = 0; i < NUM_UP; i++) {
-                int o = base + 2 + i * 2;
-                model->decoder.up[i].in_ch = up_in[i];
-                model->decoder.up[i].out_ch = up_out[i];
-                model->decoder.up[i].k = up_k[i];
-                model->decoder.up[i].stride = up_s[i];
-                model->decoder.up[i].pad = up_p[i];
-                model->decoder.up[i].weight = ptr_at(buf, wts_tensors[o + 0].offset);
-                model->decoder.up[i].bias = ptr_at(buf, wts_tensors[o + 1].offset);
-            }
-
-            for (int stage = 0; stage < 4; stage++) {
-                for (int kb = 0; kb < 3; kb++) {
-                    ResBlock *rb = &model->decoder.rb[stage * 3 + kb];
-                    rb->ch = rb_ch[stage];
-                    rb->kernel = rb_k[kb];
-                    for (int d = 0; d < RF_DILS; d++)
-                        rb->dil[d] = rb_dil[d];
-
-                    int rb_idx = stage * 3 + kb;
-                    int o = base + 2 + NUM_UP * 2 + rb_idx * 12;
-
-                    for (int d = 0; d < RF_DILS; d++) {
-                        int k = rb_k[kb];
-                        int ch = rb_ch[stage];
-                        int dil = rb_dil[d];
-
-                        rb->c1[d].in_ch = ch;
-                        rb->c1[d].out_ch = ch;
-                        rb->c1[d].k = k;
-                        rb->c1[d].pad = dil * (k - 1) / 2;
-                        rb->c1[d].dilation = dil;
-                        rb->c1[d].weight = ptr_at(buf, wts_tensors[o + d * 4 + 0].offset);
-                        rb->c1[d].bias = ptr_at(buf, wts_tensors[o + d * 4 + 1].offset);
-
-                        rb->c2[d].in_ch = ch;
-                        rb->c2[d].out_ch = ch;
-                        rb->c2[d].k = k;
-                        rb->c2[d].pad = (k - 1) / 2;
-                        rb->c2[d].dilation = 1;
-                        rb->c2[d].weight = ptr_at(buf, wts_tensors[o + d * 4 + 2].offset);
-                        rb->c2[d].bias = ptr_at(buf, wts_tensors[o + d * 4 + 3].offset);
-                    }
-                }
-            }
-
-            int cp_idx = base + 2 + NUM_UP * 2 + 12 * 12;
-            model->decoder.conv_post.in_ch = rb_ch[3];
-            model->decoder.conv_post.out_ch = 1;
-            model->decoder.conv_post.k = 7;
-            model->decoder.conv_post.pad = 3;
-            model->decoder.conv_post.dilation = 1;
-            model->decoder.conv_post.weight = ptr_at(buf, wts_tensors[cp_idx].offset);
-            model->decoder.conv_post.bias = NULL;
+        for (int i = 0; i < NUM_UP; i++) {
+            model->decoder.up[i].in_ch = up_in[i];
+            model->decoder.up[i].out_ch = up_out[i];
+            model->decoder.up[i].k = up_k[i];
+            model->decoder.up[i].stride = up_s[i];
+            model->decoder.up[i].pad = up_p[i];
+            model->decoder.up[i].weight = NULL;
+            model->decoder.up[i].bias = ptr_at(buf, wts_tensors[base + tidx++].offset);
         }
+
+        for (int stage = 0; stage < 4; stage++) {
+            for (int kb = 0; kb < 3; kb++) {
+                ResBlock *rb = &model->decoder.rb[stage * 3 + kb];
+                rb->ch = rb_ch[stage];
+                rb->kernel = rb_k[kb];
+                for (int d = 0; d < RF_DILS; d++)
+                    rb->dil[d] = rb_dil[d];
+
+                for (int d = 0; d < RF_DILS; d++) {
+                    int k = rb_k[kb];
+                    int ch = rb_ch[stage];
+                    int dil = rb_dil[d];
+
+                    rb->c1[d].in_ch = ch;
+                    rb->c1[d].out_ch = ch;
+                    rb->c1[d].k = k;
+                    rb->c1[d].pad = dil * (k - 1) / 2;
+                    rb->c1[d].dilation = dil;
+                    rb->c1[d].weight = NULL;
+                    rb->c1[d].bias = ptr_at(buf, wts_tensors[base + tidx++].offset);
+
+                    rb->c2[d].in_ch = ch;
+                    rb->c2[d].out_ch = ch;
+                    rb->c2[d].k = k;
+                    rb->c2[d].pad = (k - 1) / 2;
+                    rb->c2[d].dilation = 1;
+                    rb->c2[d].weight = NULL;
+                    rb->c2[d].bias = ptr_at(buf, wts_tensors[base + tidx++].offset);
+                }
+            }
+        }
+
+        /* conv_post: no bias, weight is NULL */
+        model->decoder.conv_post.in_ch = rb_ch[3];
+        model->decoder.conv_post.out_ch = 1;
+        model->decoder.conv_post.k = 7;
+        model->decoder.conv_post.pad = 3;
+        model->decoder.conv_post.dilation = 1;
+        model->decoder.conv_post.weight = NULL;
+        model->decoder.conv_post.bias = NULL;
     }
 
     /* ============================================================
-     * v2: Load pre-quantized int8 HiFi-GAN from file (zero-copy)
+     * Load int8 HiFi-GAN from file (zero-copy)
      * ============================================================ */
-    if (version == 2 && qdata_size > 0) {
+    if (qdata_size > 0) {
         const unsigned char *qbase =
             file_base + hdr_size + total_bytes;
         const unsigned char *sbase =
@@ -562,8 +478,6 @@ int load_vtsm(const char *path, VitsModel *model, Vocab *vocab)
             soff += cf->out_ch;
         }
 
-        model->use_int8_hifi = 1;
-        model->decoder_q_from_file = 1;
         printf("  int8 HiFi-GAN loaded from file: %.1f MB (%d scales)\n",
                qdata_size / (1024.0 * 1024.0), (int)n_scales);
     }
@@ -579,8 +493,6 @@ int load_vtsm(const char *path, VitsModel *model, Vocab *vocab)
 void free_model(VitsModel *model)
 {
     if (!model) return;
-    if (model->use_int8_hifi && !model->decoder_q_from_file)
-        hifigan_free_q(&model->decoder_q);
     if (model->vtsm_map) {
         munmap((void *)model->vtsm_map, model->vtsm_map_size);
         model->vtsm_map = NULL;

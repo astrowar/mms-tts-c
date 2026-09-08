@@ -28,7 +28,6 @@ static void print_usage(const char *prog)
         "  --multi           Synthesize all sample texts\n"
         "  --dump-dir DIR    Dump intermediate tensors for validation\n"
         "  --inject-dir DIR  Inject pre-generated latents from DIR (e.g. ref_out/)\n"
-        "  --hifi-int8       Use int8 quantized HiFi-GAN (per-channel)\n"
         "  --help            Show this help\n"
         "\n"
         "Model: default is ./model.vtsm (generate with export_weights.py)\n"
@@ -37,9 +36,8 @@ static void print_usage(const char *prog)
         "  %s --text \"Olá, mundo!\"\n"
         "  %s --text \"Bom dia\" --output bom_dia.wav --seed -1\n"
         "  %s --text \"Olá, mundo!\" --inject-dir ./ref_out\n"
-        "  %s --multi --dump-dir ./c_out\n"
-        "  %s --text \"Olá\" --hifi-int8 --dump-dir ./c_out_int8\n",
-        prog, prog, prog, prog, prog, prog);
+        "  %s --multi --dump-dir ./c_out\n",
+        prog, prog, prog, prog, prog);
 }
 
 int main(int argc, char **argv)
@@ -51,7 +49,6 @@ int main(int argc, char **argv)
     const char *inject_dir = NULL;
     int seed = 42;
     int multi = 0;
-    int hifi_int8 = 0;
 
     /* Parse args */
     for (int i = 1; i < argc; i++) {
@@ -69,8 +66,6 @@ int main(int argc, char **argv)
             dump_dir = argv[++i];
         else if (strcmp(argv[i], "--inject-dir") == 0 && i + 1 < argc)
             inject_dir = argv[++i];
-        else if (strcmp(argv[i], "--hifi-int8") == 0)
-            hifi_int8 = 1;
         else if (strcmp(argv[i], "--help") == 0 || strcmp(argv[i], "-h") == 0) {
             print_usage(argv[0]);
             return 0;
@@ -104,29 +99,12 @@ int main(int argc, char **argv)
     model->sampling_rate = SAMPLE_RATE;
     printf("  sampling rate: %d Hz\n", model->sampling_rate);
 
-    /* Int8 HiFi-GAN: use pre-quantized from file (v2) or quantize at runtime (v1) */
-    if (hifi_int8 && !model->use_int8_hifi) {
-        printf("  quantizing HiFi-GAN to int8 (per-channel) ...\n");
-        rc = hifigan_quantize(&model->decoder, &model->decoder_q);
-        if (rc != 0) {
-            fprintf(stderr, "  Error: int8 quantization failed\n");
-            free_model(model);
-            free(model);
-            return 1;
-        }
-        model->use_int8_hifi = 1;
-        printf("  int8 size: %.1f MB (scales: %d entries)\n",
-               (model->decoder_q.qdata_size) / (1024.0 * 1024.0),
-               model->decoder_q.n_scales);
-    }
-
     if (dump_dir) {
         set_dump_dir(dump_dir);
 #ifdef ENABLE_DUMP
         dp_set_dump_dir(dump_dir);
         flow_set_dump_dir(dump_dir);
-        hifigan_set_dump_dir(dump_dir);
-        if (hifi_int8) hifigan_q_set_dump_dir(dump_dir);
+        hifigan_q_set_dump_dir(dump_dir);
 #endif
     }
 

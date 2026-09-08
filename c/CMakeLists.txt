@@ -62,7 +62,6 @@ set(SRCS
     src/encoder.c
     src/duration.c
     src/flow.c
-    src/hifigan.c
     src/hifigan_q.c
     src/vtsm.c
     src/model.c

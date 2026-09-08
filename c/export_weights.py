@@ -748,8 +748,6 @@ def main():
                         help="Output .vtsm binary path")
     parser.add_argument("--header", type=str, default=None,
                         help="Output .h header path (default: <output>.h)")
-    parser.add_argument("--int8", action="store_true",
-                        help="Also write int8 quantized HiFi-GAN weights (v2 format)")
     args = parser.parse_args()
 
     if args.header is None:
@@ -761,7 +759,7 @@ def main():
     print(f"  {len(tensors)} tensors in safetensors")
     print()
 
-    export(tensors, args.output, args.header, int8=args.int8)
+    export(tensors, args.output, args.header, int8=True)
     print("Done.")
 
 

@@ -231,13 +231,11 @@ typedef struct {
     /* Flow (prior encoder) */
     CouplingBlock flow;
 
-    /* HiFi-GAN decoder */
+    /* HiFi-GAN decoder (metadata + bias pointers into vtsm file) */
     HiFiGan decoder;
 
-    /* Int8 quantized HiFi-GAN (populated by hifigan_quantize or vtsm v2) */
+    /* Int8 quantized HiFi-GAN (weights + scales from vtsm file) */
     HiFiGanQ decoder_q;
-    int use_int8_hifi;
-    int decoder_q_from_file;  /* 1 if qdata/scales are in vtsm_map (no free) */
 } VitsModel;
 
 /* ============================================================
@@ -321,18 +319,8 @@ void flow_reverse(const CouplingBlock *block,
 void flow_set_dump_dir(const char *dir);
 #endif
 
-/* --- hifigan.c --- */
-void hifigan_forward(const HiFiGan *dec,
-                     const float *mel, int mel_T,
-                     float *wave, int *wave_T);
-#ifdef ENABLE_DUMP
-void hifigan_set_dump_dir(const char *dir);
-#endif
-
 /* --- hifigan_q.c --- */
-int  hifigan_quantize(const HiFiGan *f32, HiFiGanQ *q);
-void hifigan_free_q(HiFiGanQ *q);
-void hifigan_forward_q(const HiFiGanQ *dec, const HiFiGan *f32,
+void hifigan_forward_q(const HiFiGanQ *dec,
                        const float *mel, int mel_T,
                        float *wave, int *wave_T);
 #ifdef ENABLE_DUMP

@@ -2,6 +2,14 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <time.h>
+
+static double now_ms(void)
+{
+    struct timespec ts;
+    clock_gettime(CLOCK_MONOTONIC, &ts);
+    return ts.tv_sec * 1000.0 + ts.tv_nsec / 1e6;
+}
 
 /* Optional dump support (compile with -DENABLE_DUMP) */
 #ifdef ENABLE_DUMP
@@ -53,10 +61,14 @@ int vits_synthesize(const VitsModel *m, const Vocab *vocab,
     if (seed >= 0)
         srand(seed);
 
+    /* Timing */
+    double t_start = now_ms(), t_tok, t_enc, t_dp, t_samp, t_flow, t_hifi;
+
     /* ── Stage 1: Tokenize ─────────────────────────────────────────── */
     int32_t ids[MAX_TOK_LEN];
     int T = 0;
     tokenize(vocab, text, ids, &T);
+    t_tok = now_ms();
 
     /* Attention mask: all 1s (no batch padding for single sequence).
      * Blank tokens (id=0) from add_blank are NOT padding — they participate
@@ -87,6 +99,8 @@ int vits_synthesize(const VitsModel *m, const Vocab *vocab,
     }
 
     encoder_forward(m, ids, T, mask, hidden, prior_means, prior_log_vars);
+
+    t_enc = now_ms();
 
     {
         int dim2[2] = {HIDDEN, T};
@@ -120,6 +134,7 @@ int vits_synthesize(const VitsModel *m, const Vocab *vocab,
     }
 
     dp_reverse(&m->dp, hidden, T, mask, inject_dp_lat, log_duration);
+    t_dp = now_ms();
 
     {
         int d1 = T;
@@ -210,6 +225,8 @@ int vits_synthesize(const VitsModel *m, const Vocab *vocab,
         }
     }
 
+    t_samp = now_ms();
+
     {
         int dim_mel2[2] = {FLOW_SIZE, mel_T};
         maybe_dump_f32("04_latents_sampled", latents, 2, dim_mel2);
@@ -227,6 +244,7 @@ int vits_synthesize(const VitsModel *m, const Vocab *vocab,
 
     flow_reverse(&m->flow, latents, mel_T, out_mask);
     free(out_mask);
+    t_flow = now_ms();
 
     {
         int dim_mel2[2] = {FLOW_SIZE, mel_T};
@@ -247,17 +265,25 @@ int vits_synthesize(const VitsModel *m, const Vocab *vocab,
         }
     }
 
-    /* ── Stage 6: HiFi-GAN Decoder ─────────────────────────────────── */
-    if (m->use_int8_hifi) {
-        hifigan_forward_q(&m->decoder_q, &m->decoder, latents, mel_T, waveform, wave_len);
-    } else {
-        hifigan_forward(&m->decoder, latents, mel_T, waveform, wave_len);
-    }
+    /* ── Stage 6: HiFi-GAN Decoder (int8) ──────────────────────────── */
+    hifigan_forward_q(&m->decoder_q, latents, mel_T, waveform, wave_len);
+    t_hifi = now_ms();
 
     {
         int d1 = *wave_len;
         maybe_dump_f32("06_waveform", waveform, 1, &d1);
     }
+
+    /* Print timing */
+    double total = t_hifi - t_start;
+    printf("  [profile] T=%d mel_T=%d wave=%.2fs total=%.1fms\n",
+           T, mel_T, (double)*wave_len / m->sampling_rate, total);
+    printf("    tokenize:  %7.1fms (%5.1f%%)\n", t_tok - t_start, 100.0 * (t_tok - t_start) / total);
+    printf("    encoder:   %7.1fms (%5.1f%%)\n", t_enc - t_tok, 100.0 * (t_enc - t_tok) / total);
+    printf("    duration:  %7.1fms (%5.1f%%)\n", t_dp - t_enc, 100.0 * (t_dp - t_enc) / total);
+    printf("    sampling:  %7.1fms (%5.1f%%)\n", t_samp - t_dp, 100.0 * (t_samp - t_dp) / total);
+    printf("    flow:      %7.1fms (%5.1f%%)\n", t_flow - t_samp, 100.0 * (t_flow - t_samp) / total);
+    printf("    hifi-gan:  %7.1fms (%5.1f%%)\n", t_hifi - t_flow, 100.0 * (t_hifi - t_flow) / total);
 
     /* ── Stage 7: Normalize + WAV (validation) ─────────────────────── */
 #ifdef ENABLE_DUMP
