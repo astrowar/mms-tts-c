@@ -28,6 +28,7 @@ static void print_usage(const char *prog)
         "  --multi           Synthesize all sample texts\n"
         "  --dump-dir DIR    Dump intermediate tensors for validation\n"
         "  --inject-dir DIR  Inject pre-generated latents from DIR (e.g. ref_out/)\n"
+        "  --q16             Use fixed-point (INT16) HiFi-GAN pipeline\n"
         "  --help            Show this help\n"
         "\n"
         "Model: default is ./model.vtsm (generate with export_weights.py)\n"
@@ -36,8 +37,9 @@ static void print_usage(const char *prog)
         "  %s --text \"Olá, mundo!\"\n"
         "  %s --text \"Bom dia\" --output bom_dia.wav --seed -1\n"
         "  %s --text \"Olá, mundo!\" --inject-dir ./ref_out\n"
-        "  %s --multi --dump-dir ./c_out\n",
-        prog, prog, prog, prog, prog);
+        "  %s --multi --dump-dir ./c_out\n"
+        "  %s --text \"Olá, mundo!\" --q16 --output q16.wav\n",
+        prog, prog, prog, prog, prog, prog);
 }
 
 int main(int argc, char **argv)
@@ -49,6 +51,7 @@ int main(int argc, char **argv)
     const char *inject_dir = NULL;
     int seed = 42;
     int multi = 0;
+    int use_q16 = 0;
 
     /* Parse args */
     for (int i = 1; i < argc; i++) {
@@ -66,6 +69,8 @@ int main(int argc, char **argv)
             dump_dir = argv[++i];
         else if (strcmp(argv[i], "--inject-dir") == 0 && i + 1 < argc)
             inject_dir = argv[++i];
+        else if (strcmp(argv[i], "--q16") == 0)
+            use_q16 = 1;
         else if (strcmp(argv[i], "--help") == 0 || strcmp(argv[i], "-h") == 0) {
             print_usage(argv[0]);
             return 0;
@@ -105,7 +110,21 @@ int main(int argc, char **argv)
         dp_set_dump_dir(dump_dir);
         flow_set_dump_dir(dump_dir);
         hifigan_q_set_dump_dir(dump_dir);
+        hifigan_q16_set_dump_dir(dump_dir);
 #endif
+    }
+
+    /* Initialize Q16 fixed-point pipeline if requested */
+    if (use_q16) {
+        if (hifigan_q16_init(&model->decoder_q16, &model->decoder_q) != 0) {
+            fprintf(stderr, "Error: failed to initialize Q16 HiFi-GAN\n");
+            free_model(model);
+            free(model);
+            return 1;
+        }
+        printf("  HiFi-GAN: Q16 fixed-point pipeline\n");
+    } else {
+        printf("  HiFi-GAN: INT8 + FP32 activations pipeline\n");
     }
 
     /* Determine texts and outputs */
@@ -149,7 +168,12 @@ int main(int argc, char **argv)
             return 1;
         }
 
-        if (vits_synthesize(model, &vocab, texts[i], seed, inject_dir, waveforms[i], &wave_lens[i]) != 0) {
+        int rc = use_q16
+            ? vits_synthesize_pipeline(model, &vocab, texts[i], seed,
+                                       inject_dir, waveforms[i], &wave_lens[i], 1)
+            : vits_synthesize(model, &vocab, texts[i], seed,
+                              inject_dir, waveforms[i], &wave_lens[i]);
+        if (rc != 0) {
             fprintf(stderr, "  Error: synthesis failed\n");
             free(waveforms[i]);
             for (int j = 0; j < i; j++) free(waveforms[j]);
@@ -162,7 +186,9 @@ int main(int argc, char **argv)
         printf("  -> %s (%.2fs)\n", outputs[i], duration);
     }
 
-    /* Free model weights before writing WAVs to minimize peak memory */
+    /* Free Q16 params (heap-allocated), then model weights */
+    if (model->decoder_q16.params)
+        hifigan_q16_free(&model->decoder_q16);
     free_model(model);
     free(model);
 

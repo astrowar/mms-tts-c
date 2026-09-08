@@ -210,6 +210,69 @@ typedef struct {
 } HiFiGanQ;
 
 /* ============================================================
+ * Fixed-point HiFi-GAN (INT16 activations, INT8 weights)
+ *
+ * All activations use a power-of-2 scale:
+ *   real_value = int16_value * 2^exponent
+ *
+ * Weights remain INT8 (shared with HiFiGanQ).
+ * Per-layer requantization factor (alpha_q) and bias (bias_q)
+ * are precomputed at init time so the hot path is pure integer.
+ * ============================================================ */
+
+#define Q16_ALPHA_BITS 14  /* fixed-point precision for alpha */
+
+/* Per-layer activation exponents (calibrated: 20 PT-BR sentences, margin=0.85) */
+#define Q16_MEL_EXP        (-11)
+#define Q16_CONV_PRE_EXP   (-8)
+#define Q16_STAGE0_EXP     (-9)
+#define Q16_STAGE1_EXP     (-11)
+#define Q16_STAGE2_EXP     (-12)
+#define Q16_STAGE3_EXP     (-12)
+#define Q16_CONV_POST_EXP  (-14)
+
+typedef struct {
+    int16_t *data;
+    int channels;
+    int T;
+    int exponent;
+} TensorQ16;
+
+typedef struct {
+    int in_ch, out_ch, k, pad, dilation;
+    const int8_t *weight;       /* shared pointer into mmap */
+    int in_exp, out_exp;
+    int32_t *bias_q;            /* [out_ch] */
+    int32_t *alpha_q;           /* [out_ch] */
+} Conv1dQ16;
+
+typedef struct {
+    int in_ch, out_ch, k, stride, pad;
+    const int8_t *weight;
+    int in_exp, out_exp;
+    int32_t *bias_q;
+    int32_t *alpha_q;
+} ConvTranspose1dQ16;
+
+typedef struct {
+    int ch, kernel;
+    int dil[RF_DILS];
+    Conv1dQ16 c1[RF_DILS];
+    Conv1dQ16 c2[RF_DILS];
+} ResBlockQ16;
+
+typedef struct {
+    Conv1dQ16 conv_pre;
+    ConvTranspose1dQ16 up[NUM_UP];
+    ResBlockQ16 rb[12];
+    Conv1dQ16 conv_post;
+
+    /* Single allocation for all bias_q + alpha_q */
+    int32_t *params;
+    size_t params_size;
+} HiFiGanQ16;
+
+/* ============================================================
  * Full model
  * ============================================================ */
 typedef struct {
@@ -236,6 +299,9 @@ typedef struct {
 
     /* Int8 quantized HiFi-GAN (weights + scales from vtsm file) */
     HiFiGanQ decoder_q;
+
+    /* Fixed-point HiFi-GAN (INT16 activations, initialized on demand) */
+    HiFiGanQ16 decoder_q16;
 } VitsModel;
 
 /* ============================================================
@@ -327,11 +393,42 @@ void hifigan_forward_q(const HiFiGanQ *dec,
 void hifigan_q_set_dump_dir(const char *dir);
 #endif
 
+/* --- ops_q16.c --- */
+void quantize_f32_to_q16(const float *in, int n, int exponent, int16_t *out);
+void conv1d_q16(const int16_t *in, int in_ch, int T,
+                const Conv1dQ16 *c, int16_t *out);
+void conv_transpose1d_q16(const int16_t *in, int in_ch, int T,
+                          const ConvTranspose1dQ16 *c,
+                          int16_t *out, int *out_T);
+void leaky_relu_q16(int16_t *x, int n, int slope_num, int slope_den);
+void residual_add_q16(int16_t *dst, const int16_t *src, int n);
+void mrf_div3_q16(int16_t *x, int n);
+
+/* Tanh LUT (Phase 10) */
+void  tanh_lut_init(int16_t lut[], int exp);
+int16_t tanh_q16(const int16_t *in, int n, int exp,
+                 const int16_t *lut, int16_t *out);
+
+/* --- hifigan_q16.c --- */
+int  hifigan_q16_init(HiFiGanQ16 *q16, const HiFiGanQ *q);
+void hifigan_q16_free(HiFiGanQ16 *q16);
+void hifigan_forward_q16(const HiFiGanQ16 *q16,
+                         const float *mel, int mel_T,
+                         int16_t *pcm_out, int *pcm_len);
+#ifdef ENABLE_DUMP
+void hifigan_q16_set_dump_dir(const char *dir);
+#endif
+
 /* --- model.c --- */
 int vits_synthesize(const VitsModel *m, const Vocab *vocab,
                     const char *text, int seed,
                     const char *inject_dir,   /* NULL = no injection */
                     float *waveform, int *wave_len);
+int vits_synthesize_pipeline(const VitsModel *m, const Vocab *vocab,
+                             const char *text, int seed,
+                             const char *inject_dir,
+                             float *waveform, int *wave_len,
+                             int use_q16);
 void set_dump_dir(const char *dir);
 
 /* --- wav.c --- */

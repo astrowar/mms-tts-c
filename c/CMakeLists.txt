@@ -21,6 +21,7 @@ include(CheckCCompilerFlag)
 
 set(OPS_SRC "${CMAKE_CURRENT_SOURCE_DIR}/src/ops_base.c")
 set(INT8_OPS_SRC "${CMAKE_CURRENT_SOURCE_DIR}/src/ops_int8.c")
+set(Q16_OPS_SRC "${CMAKE_CURRENT_SOURCE_DIR}/src/ops_q16.c")
 set(ARCH_FLAGS "")
 
 if(CMAKE_SYSTEM_PROCESSOR MATCHES "x86_64|AMD64|i686|i386")
@@ -28,6 +29,7 @@ if(CMAKE_SYSTEM_PROCESSOR MATCHES "x86_64|AMD64|i686|i386")
     if(HAS_AVX2)
         set(OPS_SRC "${CMAKE_CURRENT_SOURCE_DIR}/src/ops_avx.c")
         set(INT8_OPS_SRC "${CMAKE_CURRENT_SOURCE_DIR}/src/ops_int8_avx2.c")
+        set(Q16_OPS_SRC "${CMAKE_CURRENT_SOURCE_DIR}/src/ops_q16_avx2.c")
         set(ARCH_FLAGS "-mavx2;-mfma")
         message(STATUS "Architecture: x86_64 + AVX2/FMA")
     else()
@@ -58,11 +60,13 @@ set(SRCS
     src/main.c
     ${OPS_SRC}
     ${INT8_OPS_SRC}
+    ${Q16_OPS_SRC}
     src/tokenizer.c
     src/encoder.c
     src/duration.c
     src/flow.c
     src/hifigan_q.c
+    src/hifigan_q16.c
     src/vtsm.c
     src/model.c
     src/wav.c
@@ -92,6 +96,7 @@ target_link_libraries(mms-tts PRIVATE m)
 if(ARCH_FLAGS)
     set_source_files_properties(${OPS_SRC} PROPERTIES COMPILE_OPTIONS "${ARCH_FLAGS}")
     set_source_files_properties(${INT8_OPS_SRC} PROPERTIES COMPILE_OPTIONS "${ARCH_FLAGS}")
+    set_source_files_properties(${Q16_OPS_SRC} PROPERTIES COMPILE_OPTIONS "${ARCH_FLAGS}")
 endif()
 
 # model_weights.h dependency
@@ -113,5 +118,6 @@ endif()
 message(STATUS "Build type:  ${CMAKE_BUILD_TYPE}")
 message(STATUS "Ops source:  ${OPS_SRC}")
 message(STATUS "Int8 ops:    ${INT8_OPS_SRC}")
+message(STATUS "Q16 ops:     ${Q16_OPS_SRC}")
 message(STATUS "Dump:        ${ENABLE_DUMP}")
 message(STATUS "OMP:         ${ENABLE_OMP}")

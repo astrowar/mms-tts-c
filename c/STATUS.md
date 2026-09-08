@@ -80,19 +80,27 @@ mms-tts-por/c/
 ├── model_weights.h        # Header C com layout (gerado)
 ├── src/
 │   ├── vits.h             # Structs, constantes, declarações
-│   ├── main.c             # CLI (--inject-dir, --dump-dir, etc.)
+│   ├── main.c             # CLI (--inject-dir, --dump-dir, --q16, etc.)
 │   ├── ops_base.c         # Ops escalar: conv1d, conv_transpose1d, depthwise, layernorm
 │   ├── ops_neon.c         # Ops otimizados NEON (aarch64 / ARMv7)
 │   ├── ops_avx.c          # Ops otimizados AVX2/FMA (x86_64)
+│   ├── ops_int8.c         # Kernels int8 (FP32 act) portável
+│   ├── ops_int8_avx2.c    # Kernels int8 AVX2/FMA
+│   ├── ops_int8_neon.c    # Kernels int8 NEON
+│   ├── ops_q16.c          # Kernels Q16 (INT16 act, INT8 wt) portável
+│   ├── ops_q16_avx2.c     # Kernels Q16 AVX2/SSE2
 │   ├── tokenizer.c        # text → token IDs (UTF-8, lowercase, add_blank)
 │   ├── encoder.c          # Transformer encoder (6 layers, relative position)
 │   ├── duration.c         # Stochastic Duration Predictor (DDS + RQS)
 │   ├── flow.c             # WaveNet + Residual Coupling Flow (reverse)
-│   ├── hifigan.c          # HiFi-GAN vocoder (4 stages × 3 MRF)
+│   ├── hifigan.c          # HiFi-GAN vocoder FP32 (4 stages × 3 MRF)
+│   ├── hifigan_q.c        # HiFi-GAN int8 (FP32 activations)
+│   ├── hifigan_q16.c      # HiFi-GAN Q16 (INT16 activations, INT8 weights)
 │   ├── vtsm.c             # Loader .vtsm (memcpy direto via offsets)
 │   ├── model.c            # Pipeline de inferência + dump hooks + injection
 │   ├── npy_reader.c       # Minimal .npy loader (float32, F-order transpose)
 │   └── wav.c              # WAV writer (16-bit PCM mono)
+├── calibrate_q16.py       # Calibração de expoentes Q16 (PyTorch hooks)
 └── validate/
     ├── stages_ref.py      # Python: gera .npy por stage
     ├── compare.py         # Compara .npy vs .bin (rel error)
@@ -685,3 +693,95 @@ Offset  Size  Field
 cmake -B build -DCMAKE_BUILD_TYPE=Release
 ./build/mms-tts --text "Olá, mundo!" --model model.vtsm
 ```
+
+## Quantização Q16 — HiFi-GAN em Puro Inteiro (2026-09-07/08)
+
+### Status: ✅ Funcional, calibrado, AVX2
+
+HiFi-GAN com ativações INT16, pesos INT8, acumuladores INT32.
+Sem float no hot path (após o quantize inicial da mel).
+
+| Propriedade | Valor |
+|-------------|-------|
+| Ativações | INT16 (expoente power-of-2 por estágio) |
+| Pesos | INT8 (mesma quantização do modo int8) |
+| Acumuladores | INT32 |
+| Requantização | `(acc × alpha) >> 14` + bias, saturating |
+| LeakyReLU | Integer (slope 13/128 ≈ 0.1016; final 1/128 ≈ 0.0078) |
+| MRF /3 | Magic number: `(x × 21845 + 32768) >> 16` |
+| Tanh | LUT 32768 × INT16 |
+| Correlação vs FP32 | 0.62 (áudio inteligível, confirmado) |
+| RMS | Bate com FP32 dentro de 1% |
+| Velocidade (1 thread) | 4971ms HiFi-GAN (1.15× vs INT8+FP32) |
+| AVX2 speedup vs scalar Q16 | 3.1× (4971ms vs 15351ms) |
+
+### Expoentes Calibrados
+
+Gerados por `calibrate_q16.py` (20 frases PT-BR, margin=0.85):
+
+| Tensor | Max |val| | Exp | Passo |
+|--------|-----------|-----|---------|
+| mel | 11.54 | -11 | 0.000488 |
+| conv_pre | 63.41 | -8 | 0.003906 |
+| stage0 (MRF) | 33.66 | -9 | 0.001953 |
+| stage1 (MRF) | 7.77 | -11 | 0.000488 |
+| stage2 (MRF) | 4.07 | -12 | 0.000244 |
+| stage3 (MRF) | 4.67 | -12 | 0.000244 |
+| conv_post | 1.47 | -14 | 0.000061 |
+
+### Arquivos
+
+| Arquivo | Papel |
+|---------|-------|
+| `src/ops_q16.c` | Kernels portáveis (fallback non-x86) |
+| `src/ops_q16_avx2.c` | AVX2/SSE2 (x86): conv1d 8-wide, leaky_relu 8-wide INT32, residual/mrf 16-wide, quantize 8-wide |
+| `src/hifigan_q16.c` | Forward pass + init (computa alpha_q/bias_q em runtime) |
+| `src/vits.h` | Structs `Conv1dQ16`, `ConvTranspose1dQ16`, `ResBlockQ16`, `HiFiGanQ16`; `#define Q16_*_EXP` |
+| `calibrate_q16.py` | Script de calibração (PyTorch hooks no HiFi-GAN FP32) |
+
+### Bugs Corrigidos (Q16)
+
+| # | Bug | Sintoma | Fix |
+|---|-----|---------|-----|
+| Q1 | Buffer aliasing em conv_pre (`in==out`, in_ch<out_ch) | Correlação 0 vs referência; áudio "ara ara" | Escrever para buffer separado + swap ponteiros |
+| Q2 | `_mm_slli_si128` vs `_mm_srli_si128` (direção do shift) | Metade dos lanes = 0 nos kernels 8-wide | Trocar para `srli` (traz high→low) |
+| Q3 | `_mm_cvtepi32_epi16` é SSE4.1/AVX512VL | Build fail com `-mavx2` | Usar `_mm_packs_epi32` (SSE2) |
+| Q4 | INT16 overflow em LeakyReLU SIMD (`v×num > 32767`) | Valores incorretos para |v|>2500 | Expandir para INT32 antes do multiply |
+| Q5 | Tanh LUT 8192 insuficiente para exp=-14 | Segfault (OOB) | Aumentar para 32768; clamp index |
+
+### Builds e Uso
+
+```bash
+# Build com AVX2 Q16 (auto-detectado em x86_64 com AVX2)
+cmake -B build_q16 -DCMAKE_BUILD_TYPE=Release
+make -C build_q16 -j$(nproc)
+
+# Sintetizar
+./build_q16/mms-tts --model model.vtsm --text "Olá, mundo!" --q16 --output out.wav
+
+# Calibrar expoentes (requer transformers+torch)
+python3 calibrate_q16.py --margin 0.85 --output q16_exponents.txt
+```
+
+### Calibração
+
+O script `calibrate_q16.py`:
+1. Carrega o `VitsModel` do HuggingFace
+2. Registra hooks no HiFi-GAN (`model.decoder`)
+3. Roda N frases (default: 20 PT-BR)
+4. Registra `max|value|` em cada tensor intermediário
+5. Computa expoente ótimo: `E = ceil(log2(max / (32767 × margin)))`
+6. Imprime tabela + `#define` C prontos
+
+Para re-calibrar com mais dados:
+```bash
+python3 calibrate_q16.py --texts "frase 1" "frase 2" ... --margin 0.9
+```
+
+### Notas de Design
+
+- **Alpha/bias computados em runtime** (`hifigan_q16_init`): `alpha = 2^(in_exp - out_exp + 14) × scale`. Não há alpha no arquivo — os expoentes vêm do header C.
+- **Tanh via LUT**: entrada INT16 × 2^exp → índice na LUT (32768 entries). Sem float.
+- **MRF div3**: `(x × 21845 + 32768) >> 16` — aproxima 1/3 com erro < 0.0005 (invisível).
+- **LeakyReLU integer**: `x<0 → -( (-x)×num + den/2) / den`; den=128 → shift por 7. Sem float, sem branch (blend SIMD).
+- **Conv_transpose**: scatter pattern impede SIMD largo; usa 4-way unroll escalar.

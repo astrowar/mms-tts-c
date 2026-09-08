@@ -39,6 +39,12 @@ void set_dump_dir(const char *dir)
 #endif
 }
 
+static int vits_synthesize_impl(const VitsModel *m, const Vocab *vocab,
+                                const char *text, int seed,
+                                const char *inject_dir,
+                                float *waveform, int *wave_len,
+                                int use_q16);
+
 /* ============================================================
  * vits_synthesize: Full inference pipeline
  *
@@ -57,6 +63,27 @@ int vits_synthesize(const VitsModel *m, const Vocab *vocab,
                     const char *text, int seed,
                     const char *inject_dir,
                     float *waveform, int *wave_len)
+{
+    return vits_synthesize_impl(m, vocab, text, seed, inject_dir,
+                                waveform, wave_len, 0);
+}
+
+/* Extended version with pipeline selection */
+int vits_synthesize_pipeline(const VitsModel *m, const Vocab *vocab,
+                             const char *text, int seed,
+                             const char *inject_dir,
+                             float *waveform, int *wave_len,
+                             int use_q16)
+{
+    return vits_synthesize_impl(m, vocab, text, seed, inject_dir,
+                                waveform, wave_len, use_q16);
+}
+
+int vits_synthesize_impl(const VitsModel *m, const Vocab *vocab,
+                         const char *text, int seed,
+                         const char *inject_dir,
+                         float *waveform, int *wave_len,
+                         int use_q16)
 {
     if (seed >= 0)
         srand(seed);
@@ -265,8 +292,26 @@ int vits_synthesize(const VitsModel *m, const Vocab *vocab,
         }
     }
 
-    /* ── Stage 6: HiFi-GAN Decoder (int8) ──────────────────────────── */
-    hifigan_forward_q(&m->decoder_q, latents, mel_T, waveform, wave_len);
+    /* ── Stage 6: HiFi-GAN Decoder ─────────────────────────────────── */
+    if (use_q16 && m->decoder_q16.params) {
+        /* Q16 fixed-point pipeline: outputs INT16 PCM directly */
+        int16_t *pcm = (int16_t *)malloc(sizeof(int16_t) *
+                                          (size_t)mel_T * TOTAL_UP);
+        if (!pcm) {
+            fprintf(stderr, "Error: OOM in Q16 HiFi-GAN\n");
+            free(inject_dp_buf); free(latents); free(durations);
+            free(log_duration); free(hidden);
+            free(prior_means); free(prior_log_vars);
+            return -1;
+        }
+        hifigan_forward_q16(&m->decoder_q16, latents, mel_T, pcm, wave_len);
+        /* Convert INT16 → float for the existing output pipeline */
+        for (int i = 0; i < *wave_len; i++)
+            waveform[i] = (float)pcm[i] / 32768.0f;
+        free(pcm);
+    } else {
+        hifigan_forward_q(&m->decoder_q, latents, mel_T, waveform, wave_len);
+    }
     t_hifi = now_ms();
 
     {

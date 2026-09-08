@@ -342,3 +342,62 @@ Resultado: relRMS/SNR idêntico ao AVX2 (diferença < 0.04% — FMA rounding).
   Field (3 kernels: 3, 7, 11; dilations: 1, 3, 5) + 4 ConvTranspose
 - Per-channel symmetric quantization: padrão TFLite/ONNX Runtime
 - Fan-in error amplification: análise empírica neste documento
+
+## Q16 — HiFi-GAN em Puro Inteiro (2026-09-07/08)
+
+Estágio adicional: ativações também em inteiro (INT16 com expoentes
+power-of-2 por estágio). Elimina o float32 do hot path — tudo inteiro
+após o quantize inicial da mel.
+
+### Esquema
+
+```
+Ativações:    real = int16 × 2^exp  (exp calibrado por estágio)
+Pesos:        int8 (mesma quantização do modo int8)
+Acumuladores: int32
+
+Conv1D:
+    acc[o,t] = Σ_{i,j} in[i, t+j·dil-pad] × w_q[o,i,j]     (INT32)
+    out[o,t] = saturate( (acc × alpha_q[o] + 2^13) >> 14 + bias_q[o] )
+
+    alpha_q[o] = round( 2^(in_exp - out_exp + 14) × scale[o] )
+    bias_q[o]  = round( bias_f32[o] × 2^(-out_exp) )
+
+Outras ops (puro integer, sem float):
+    LeakyReLU(p/128):  x<0 → -( (-x)×p + 64) >> 7
+    MRF /3:            (x × 21845 + 32768) >> 16
+    Residual:          saturate(a + b)
+    Tanh:              LUT[|x|] (32768 entries), negate se x<0
+```
+
+### Expoentes Calibrados (20 frases PT-BR, margin=0.85)
+
+| Estágio | Max |val| | Exp | Passo |
+|---------|-----------|-----|---------|
+| mel | 11.54 | -11 | 4.88e-4 |
+| conv_pre | 63.41 | -8 | 3.91e-3 |
+| stage0 (MRF) | 33.66 | -9 | 1.95e-3 |
+| stage1 (MRF) | 7.77 | -11 | 4.88e-4 |
+| stage2 (MRF) | 4.07 | -12 | 2.44e-4 |
+| stage3 (MRF) | 4.67 | -12 | 2.44e-4 |
+| conv_post | 1.47 | -14 | 6.1e-5 |
+
+### Resultados
+
+| Métrica | Q16 AVX2 | INT8+FP32 (ref) |
+|---------|----------|-----------------|
+| Correlação waveform vs FP32 | 0.62 | 0.9996 |
+| RMS waveform | ±1% vs FP32 | 2.83% |
+| HiFi-GAN (1 thread, 2.02s audio) | 4971 ms | 4341 ms |
+| AVX2 vs scalar Q16 | 3.1× | — |
+| Áudio inteligível | ✅ | ✅ |
+
+### Arquivos
+
+| Arquivo | Papel |
+|---------|-------|
+| `src/ops_q16.c` | Kernels portáveis (fallback) |
+| `src/ops_q16_avx2.c` | AVX2: conv1d 8-wide, leaky_relu 8-wide INT32, residual/mrf 16-wide, quantize 8-wide |
+| `src/hifigan_q16.c` | Forward pass + init (alpha/bias runtime) |
+| `src/vits.h` | Structs `Conv1dQ16` etc + `#define Q16_*_EXP` |
+| `calibrate_q16.py` | Calibração via PyTorch hooks |
